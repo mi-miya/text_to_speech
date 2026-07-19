@@ -40,8 +40,17 @@ class Config:
 
     @rate.setter
     def rate(self, value):
+        self.set_rate(value, persist=True)
+
+    def set_rate(self, value, persist=True):
+        """話速を更新する。persist=False ならファイル保存を省く。
+
+        スライダーのドラッグ中は毎フレーム保存するとディスク書き込みが多発する
+        ため、ドラッグ中は persist=False で即時反映だけ行い、確定時に save() する。
+        """
         self._data["rate"] = max(-10, min(10, int(value)))
-        self.save()
+        if persist:
+            self.save()
 
     @property
     def voice(self):

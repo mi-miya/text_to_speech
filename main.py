@@ -34,16 +34,8 @@ WM_LBUTTONUP = 0x0202
 VK_CONTROL = 0x11
 VK_MENU = 0x12  # Alt
 
-RATE_PRESETS = [
-    ("遅い", -4),
-    ("やや遅い", -2),
-    ("標準", 0),
-    ("やや速い", 2),
-    ("速い", 4),
-    ("かなり速い", 6),
-    ("高速", 8),
-    ("最速", 10),
-]
+RATE_MIN = -10  # SAPI 話速の下限(最も遅い)
+RATE_MAX = 10   # SAPI 話速の上限(最も速い)。0 が標準。刻みはこの 21 段階が最小
 
 COLOR_IDLE = "#1E6ED2"      # 待機中: 青
 COLOR_SPEAKING = "#2FA84F"  # 読み上げ中: 緑
@@ -117,6 +109,10 @@ class FloatingWidget:
         self._has_moved = False
         self._flashing = False
 
+        self._rate_win = None       # 話速調整ウィンドウ(単一インスタンス)
+        self._rate_scale = None
+        self._rate_save_job = None  # ドラッグ確定を遅延保存するための after id
+
         self._poll_state()
 
     # ---- メニュー ----
@@ -126,13 +122,7 @@ class FloatingWidget:
         self.menu.add_command(label="読み上げを停止 (Esc)", command=self.app.speech.stop)
         self.menu.add_separator()
 
-        self._rate_var = tk.IntVar(value=self.app.config.rate)
-        rate_menu = tk.Menu(self.menu, tearoff=0)
-        for label, value in RATE_PRESETS:
-            rate_menu.add_radiobutton(
-                label=label, value=value, variable=self._rate_var,
-                command=lambda v=value: self.app.set_rate(v))
-        self.menu.add_cascade(label="話速", menu=rate_menu)
+        self.menu.add_command(label="話速を調整...", command=self._open_rate_dialog)
 
         self._voice_var = tk.StringVar(value=self.app.config.voice or "")
         voice_menu = tk.Menu(self.menu, tearoff=0)
@@ -153,6 +143,77 @@ class FloatingWidget:
             self.menu.tk_popup(event.x_root, event.y_root)
         finally:
             self.menu.grab_release()
+
+    # ---- 話速の調整(スライダー) ----
+
+    def _open_rate_dialog(self):
+        # 既に開いていれば前面に出すだけ(二重起動を防ぐ)
+        if self._rate_win is not None and self._rate_win.winfo_exists():
+            self._rate_win.deiconify()
+            self._rate_win.lift()
+            self._rate_win.focus_force()
+            return
+
+        win = tk.Toplevel(self.root)
+        self._rate_win = win
+        win.title("話速の調整")
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        win.configure(padx=16, pady=12)
+        win.protocol("WM_DELETE_WINDOW", self._close_rate_dialog)
+
+        tk.Label(win, text="遅い ←  0=標準  → 速い",
+                 font=("Yu Gothic UI", 10)).pack(anchor="w")
+
+        self._rate_scale = tk.Scale(
+            win, from_=RATE_MIN, to=RATE_MAX, orient="horizontal", length=300,
+            resolution=1, tickinterval=5, showvalue=True,
+            font=("Yu Gothic UI", 9), command=self._on_rate_slide)
+        self._rate_scale.set(self.app.config.rate)
+        self._rate_scale.pack(fill="x", pady=(4, 8))
+        # ドラッグ確定時に保存(キー操作でも動くよう遅延保存も併用)
+        self._rate_scale.bind("<ButtonRelease-1>", lambda e: self._persist_rate())
+
+        btns = tk.Frame(win)
+        btns.pack(fill="x")
+        tk.Button(btns, text="試聴", width=8, command=self._preview_rate).pack(side="left")
+        tk.Button(btns, text="標準に戻す", width=10, command=self._reset_rate).pack(
+            side="left", padx=6)
+        tk.Button(btns, text="閉じる", width=8, command=self._close_rate_dialog).pack(
+            side="right")
+
+        # フローティングアイコンの近くに表示する
+        win.update_idletasks()
+        wx, wy = self.root.winfo_x(), self.root.winfo_y()
+        win.geometry(f"+{max(0, wx - 330)}+{max(0, wy)}")
+
+    def _on_rate_slide(self, value):
+        rate = int(float(value))
+        self.app.set_rate(rate, persist=False)  # 即時反映(保存は遅延)
+        if self._rate_save_job is not None:
+            self.root.after_cancel(self._rate_save_job)
+        self._rate_save_job = self.root.after(500, self._persist_rate)
+
+    def _persist_rate(self):
+        if self._rate_save_job is not None:
+            self.root.after_cancel(self._rate_save_job)
+            self._rate_save_job = None
+        self.app.config.save()
+
+    def _preview_rate(self):
+        self.app.speech.speak("これは話速の試聴です。1、2、3、4、5。")
+
+    def _reset_rate(self):
+        if self._rate_scale is not None:
+            self._rate_scale.set(0)  # _on_rate_slide が呼ばれ即時反映される
+        self._persist_rate()
+
+    def _close_rate_dialog(self):
+        self._persist_rate()
+        if self._rate_win is not None:
+            self._rate_win.destroy()
+            self._rate_win = None
+            self._rate_scale = None
 
     # ---- ドラッグ移動 / クリック ----
 
@@ -245,8 +306,8 @@ class App:
 
     # ---- 設定変更 ----
 
-    def set_rate(self, value):
-        self.config.rate = value
+    def set_rate(self, value, persist=True):
+        self.config.set_rate(value, persist)
         self.speech.set_rate(value)
 
     def set_voice(self, name):
