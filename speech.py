@@ -15,6 +15,29 @@ import win32com.client
 SVSF_ASYNC = 1
 SVSF_PURGE = 2
 
+# 自然音声(ニューラル合成)は Speak に渡した塊をある程度まとめて合成してから
+# 再生を始める。クリック位置から文末までの全文を一度に渡すと、最初の音が出るまで
+# 全体の合成を待たされる。そこで「最初の一文」だけ先に鳴らし、残りは後ろにキュー
+# することで、立ち上がりを「1 文分の合成時間」まで短縮する。
+_SENTENCE_END = re.compile(r"(?<=[。!?！?\n])")
+FIRST_CHUNK_MIN = 60  # 最初に鳴らす塊のおおよその下限文字数(短すぎる細切れを防ぐ)
+
+
+def _split_first(text):
+    """最初のひとまとまり(概ね FIRST_CHUNK_MIN 以上の一文)と残りに分ける。
+
+    句点等が全く無い塊はそのまま返す(不自然な途中切りを避ける)。
+    """
+    parts = [p for p in _SENTENCE_END.split(text) if p]
+    if len(parts) <= 1:
+        return text, ""
+    first = parts[0]
+    idx = 1
+    while idx < len(parts) and len(first) < FIRST_CHUNK_MIN:
+        first += parts[idx]
+        idx += 1
+    return first, "".join(parts[idx:])
+
 # 一部アプリはソフト改行や区切りに制御文字を使う。これらは改行に寄せる。
 _LINE_SEPARATORS = str.maketrans({
     "\x0b": "\n", "\x0c": "\n",                # 垂直タブ / 改ページ
@@ -103,7 +126,12 @@ class SpeechEngine:
                 continue
             try:
                 if cmd == "speak":
-                    voice.Speak(arg, SVSF_ASYNC | SVSF_PURGE)
+                    # 最初の一文だけ即座に再生(PURGE で前の読み上げを止める)、
+                    # 残りは PURGE 無しで後ろにキューし、続けて滑らかに読ませる。
+                    first, rest = _split_first(arg)
+                    voice.Speak(first, SVSF_ASYNC | SVSF_PURGE)
+                    if rest:
+                        voice.Speak(rest, SVSF_ASYNC)
                     self._speaking = True
                 elif cmd == "stop":
                     voice.Speak("", SVSF_ASYNC | SVSF_PURGE)

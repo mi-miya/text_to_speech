@@ -14,6 +14,7 @@
 import os
 import queue
 import threading
+import time
 
 import uiautomation as auto
 
@@ -54,11 +55,14 @@ class TextCapturer(threading.Thread):
                 while not self._q.empty():
                     x, y = self._q.get()
                 lines = []
+                started = time.perf_counter()
                 try:
                     text = self._extract(x, y, lines)
                 except Exception as e:
                     text = None
                     lines.append(f"EXCEPTION: {type(e).__name__}: {e}")
+                elapsed = time.perf_counter() - started
+                lines.insert(0, f"取得所要時間={elapsed * 1000:.0f}ms")
                 self._write_debug(x, y, text, lines)
                 if text and text.strip():
                     self._on_text(text)
@@ -172,27 +176,49 @@ class TextCapturer(threading.Thread):
     # ---- 子孫走査による本文再構成(Electron/Chromium 系向け) ----
 
     def _aggregate_ancestors(self, ancestors, log):
-        """祖先を下から上へ辿り、配下の TextControl 葉を集約した本文を返す。
+        """祖先を下から上へ辿り、クリックしたメッセージ相当の最小ブロックを返す。
 
-        上限(BLOCK_MAX)を超えたら会話ペイン全体を掴んだとみなして打ち切り、
-        それ未満で最大の集約テキスト(=クリックしたメッセージ相当のまとまり)を採る。
+        メッセージ内の入れ子ラッパは同程度のテキスト量が続く“踊り場”を作り、
+        会話ペイン(=複数メッセージ)に達すると量が急増する。その急増の直前を
+        1 メッセージ分のまとまりとみなして採用する。
+
+        急増レベルの走査は「確定済み best の 2 倍強」で打ち切るため、会話ペイン
+        全体を最後まで走査せずに済み、Electron 系でも高速に決定できる。
         """
         best = ""
+        stable = False  # 直前に“踊り場”(テキスト量が増えないレベル)を観測したか
         for node in ancestors:
-            agg = self._collect_descendant_text(node)
-            if len(agg) > BLOCK_MAX:
-                log.append(f"=> 集約 上限超過 len={len(agg)} で打ち切り")
-                break
+            # best が決まっていれば、その 2 倍強を超える量は別メッセージも含む
+            # 上位コンテナと判断する。cap を走査上限にも使い、無駄走査を防ぐ。
+            cap = min(BLOCK_MAX, max(AGG_TRIGGER, len(best) * 2 + AGG_TRIGGER))
+            agg = self._collect_descendant_text(node, cap)
+            if len(agg) > cap:
+                if stable:
+                    # 踊り場の後の急増 = メッセージ境界を越え上位コンテナに到達。
+                    # 直前の best(1 メッセージ分)を採用して打ち切る。
+                    log.append(f"=> 集約 急増検出 len>cap={cap} → bestLen={len(best)} で確定")
+                    break
+                # 踊り場なしの急増 = 連続した 1 つの大きな本文。上限を上げて取り込む。
+                best = self._collect_descendant_text(node, BLOCK_MAX)
+                stable = False
+                continue
             if len(agg) > len(best):
                 best = agg
+                stable = False
+            else:
+                stable = True  # 量が増えなかった = メッセージ単位の踊り場
         log.append(f"=> 集約 bestLen={len(best)}")
         return best
 
-    def _collect_descendant_text(self, root):
-        """root 配下の TextControl 葉のテキストを文書順(前順走査)で連結する。"""
+    def _collect_descendant_text(self, root, char_limit=BLOCK_MAX):
+        """root 配下の TextControl 葉のテキストを文書順(前順走査)で連結する。
+
+        char_limit を超えたら走査を打ち切る。呼び出し側が小さい上限を渡すことで、
+        会話ペイン全体のような巨大な部分木を最後まで走査せず高速に判定できる。
+        """
         parts = []
         state = {"nodes": 0, "chars": 0}
-        limit = BLOCK_MAX + ANCHOR_MAX  # 打ち切り判定用の余裕を持たせた上限
+        limit = char_limit + ANCHOR_MAX  # 打ち切り判定用の余裕を持たせた上限
 
         def walk(node, depth):
             if node is None or depth > MAX_DESCEND:
