@@ -129,7 +129,19 @@ class TextCapturer(threading.Thread):
             log.append("=> テキスト取得できず")
             return None
 
-        # クリックした行を目印として本文中の開始位置を求める
+        # TextPattern を持つアプリ(ブラウザ / VSCode 等)は、クリック位置(行頭)から
+        # 文書末尾までを直接切り出すのが最も確実。全文取得+アンカー照合は、文書が
+        # max_chars を超えると頭が切れてクリック行を取り込めず、先頭から読み直して
+        # しまう(長い会話の途中をクリックすると上から読み始める症状の正体)。
+        if big_pat is not None:
+            tail = self._range_from_point_to_end(big_pat, x, y)
+            if tail and tail.strip():
+                log.append(f"=> クリック位置→末尾 成功 長={len(tail)}")
+                return tail
+            log.append("=> RangeFromPoint 取得できず → アンカー方式へ")
+
+        # アンカー方式: クリックした行を目印に、再構成した本文中の開始位置を求める
+        # (TextPattern を持たない Electron 系アプリ向け)
         anchor = self._anchor_line(near_pat, x, y) if near_pat else ""
         if not anchor and big_pat is not None:
             anchor = self._anchor_line(big_pat, x, y)
@@ -144,14 +156,7 @@ class TextCapturer(threading.Thread):
                 return full_text[idx:]
             log.append("=> anchor 本文中に見つからず")
 
-        # フォールバック1: 大コンテナ上で RangeFromPoint → 末尾まで
-        if big_pat is not None:
-            tail = self._range_from_point_to_end(big_pat, x, y)
-            if tail and tail.strip() and len(tail) >= len(full_text):
-                log.append(f"=> フォールバック RangeFromPoint 成功 長={len(tail)}")
-                return tail
-
-        # フォールバック2: 再構成した本文全体を読む
+        # フォールバック: 再構成した本文全体を読む
         log.append(f"=> フォールバック 全文読み上げ 長={len(full_text)}")
         return full_text
 
@@ -186,27 +191,20 @@ class TextCapturer(threading.Thread):
         全体を最後まで走査せずに済み、Electron 系でも高速に決定できる。
         """
         best = ""
-        stable = False  # 直前に“踊り場”(テキスト量が増えないレベル)を観測したか
-        for node in ancestors:
-            # best が決まっていれば、その 2 倍強を超える量は別メッセージも含む
-            # 上位コンテナと判断する。cap を走査上限にも使い、無駄走査を防ぐ。
+        for depth, node in enumerate(ancestors):
+            # best が決まっていれば、その 2 倍強を超える量は「別メッセージも含む
+            # 上位コンテナ(会話ペイン)」に達したと判断する。cap は走査の打ち切り
+            # 上限にも使うので、長い会話でもペイン全体を最後まで走査しない。
             cap = min(BLOCK_MAX, max(AGG_TRIGGER, len(best) * 2 + AGG_TRIGGER))
             agg = self._collect_descendant_text(node, cap)
+            log.append(f"  集約[{depth}] len={len(agg)} cap={cap}")
             if len(agg) > cap:
-                if stable:
-                    # 踊り場の後の急増 = メッセージ境界を越え上位コンテナに到達。
-                    # 直前の best(1 メッセージ分)を採用して打ち切る。
-                    log.append(f"=> 集約 急増検出 len>cap={cap} → bestLen={len(best)} で確定")
-                    break
-                # 踊り場なしの急増 = 連続した 1 つの大きな本文。上限を上げて取り込む。
-                best = self._collect_descendant_text(node, BLOCK_MAX)
-                stable = False
-                continue
+                # 量が急増 = クリックしたメッセージの外側に到達。直前の best
+                # (1 メッセージ分)を採用し、会話全体を走査せずに打ち切る。
+                log.append(f"=> 集約 急増検出 → bestLen={len(best)} で確定")
+                break
             if len(agg) > len(best):
                 best = agg
-                stable = False
-            else:
-                stable = True  # 量が増えなかった = メッセージ単位の踊り場
         log.append(f"=> 集約 bestLen={len(best)}")
         return best
 
@@ -258,10 +256,20 @@ class TextCapturer(threading.Thread):
             return ""
 
     def _range_from_point_to_end(self, pattern, x, y):
+        """クリック位置(行頭にそろえる)から文書末尾までのテキストを返す。
+
+        全文取得+アンカー照合と違い、文書が max_chars を超えていても影響を受けず、
+        クリック位置から前方へ最大 max_chars 分を確実に取得できる。
+        """
         try:
             r = pattern.RangeFromPoint(x, y)
             if r is None:
                 return ""
+            # 開始位置を行頭にそろえる(文の途中から読み始めないため)
+            try:
+                r.ExpandToEnclosingUnit(auto.TextUnit.Line, waitTime=0)
+            except Exception:
+                pass
             ok = r.MoveEndpointByRange(End, pattern.DocumentRange, End, waitTime=0)
             if not ok:
                 return ""
