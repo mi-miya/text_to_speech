@@ -19,6 +19,16 @@ import uiautomation as auto
 
 MAX_WALK_UP = 20      # TextPattern を探して親を辿る最大段数
 ANCHOR_MAX = 400      # クリック行から採るアンカー文字数の上限
+
+# Electron/Chromium 系アプリ(Claude Desktop 等)は本文を 1 行ごとに別々の
+# TextControl へ分割し、親の GroupControl は TextPattern を持たない。そのため
+# 「最大の TextPattern コンテナ」を採ってもクリック行 1 行しか取れず、読み上げが
+# すぐ止まる。この場合は祖先配下の TextControl 葉を文書順にたどって本文を再構成する。
+AGG_TRIGGER = 500     # TextPattern 本文がこれ未満なら子孫走査で本文を再構成する
+BLOCK_MAX = 20000     # 集約テキストの上限。会話ペイン全体の取り込みを防ぐ
+MAX_DESCEND = 40      # 子孫を辿る最大の深さ
+MAX_NODES = 6000      # 1 回の集約で走査するノード数の上限(暴走防止)
+
 DEBUG_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "capture_debug.log")
 
 End = auto.TextPatternRangeEndpoint.End
@@ -60,12 +70,15 @@ class TextCapturer(threading.Thread):
     def _extract(self, x, y, log):
         control = auto.ControlFromPoint(x, y)
 
-        # クリック位置から親へ辿り、TextPattern を持つ祖先をすべて集める
-        providers = []  # (control, pattern, doc_text)
+        # クリック位置から親へ辿り、TextPattern を持つ祖先をすべて集める。
+        # あわせて祖先ノード自体も記録し、集約フォールバックの起点に使う。
+        providers = []   # (control, pattern, doc_text)
+        ancestors = []   # クリック要素から上へ辿ったノード列
         node = control
         for depth in range(MAX_WALK_UP):
             if node is None:
                 break
+            ancestors.append(node)
             name = ""
             try:
                 name = node.Name or ""
@@ -91,38 +104,52 @@ class TextCapturer(threading.Thread):
             except Exception:
                 break
 
-        if not providers:
-            log.append("=> TextPattern を持つ要素なし")
-            return None
-
-        # 最も多くのテキストを含むコンテナ = 読み上げ対象の本文
-        big_ctrl, big_pat, big_text = max(providers, key=lambda p: len(p[2]))
-        # クリック位置に最も近い(最初に見つかった)要素で位置を特定する
-        near_pat = providers[0][1]
+        # 最も多くのテキストを含む TextPattern コンテナ = 通常アプリの本文
+        big_pat = None
+        big_text = ""
+        near_pat = None
+        if providers:
+            _, big_pat, big_text = max(providers, key=lambda p: len(p[2]))
+            near_pat = providers[0][1]  # クリック位置に最も近い要素で位置を特定
         log.append(f"=> providers={len(providers)} bigDocLen={len(big_text)}")
 
-        # クリックした行を目印として全文中の開始位置を求める
-        anchor = self._anchor_line(near_pat, x, y)
-        if not anchor:
+        # TextPattern 本文が短すぎる(Electron 系で 1 行しか取れない)場合は、
+        # 祖先配下の TextControl 葉を集約して本文を再構成する。
+        full_text = big_text
+        if len(big_text) < AGG_TRIGGER:
+            agg_text = self._aggregate_ancestors(ancestors, log)
+            if len(agg_text) > len(full_text):
+                full_text = agg_text
+
+        if not full_text:
+            log.append("=> テキスト取得できず")
+            return None
+
+        # クリックした行を目印として本文中の開始位置を求める
+        anchor = self._anchor_line(near_pat, x, y) if near_pat else ""
+        if not anchor and big_pat is not None:
             anchor = self._anchor_line(big_pat, x, y)
+        if not anchor:
+            anchor = self._node_text(control)  # クリックした要素自身のテキスト
         log.append(f"=> anchor={anchor[:40]!r}")
 
         if anchor:
-            idx = _find_anchor(big_text, anchor)
+            idx = _find_anchor(full_text, anchor)
             if idx >= 0:
-                log.append(f"=> anchor 一致 idx={idx} 読み上げ長={len(big_text) - idx}")
-                return big_text[idx:]
-            log.append("=> anchor 全文中に見つからず")
+                log.append(f"=> anchor 一致 idx={idx} 読み上げ長={len(full_text) - idx}")
+                return full_text[idx:]
+            log.append("=> anchor 本文中に見つからず")
 
         # フォールバック1: 大コンテナ上で RangeFromPoint → 末尾まで
-        tail = self._range_from_point_to_end(big_pat, x, y)
-        if tail and tail.strip():
-            log.append(f"=> フォールバック RangeFromPoint 成功 長={len(tail)}")
-            return tail
+        if big_pat is not None:
+            tail = self._range_from_point_to_end(big_pat, x, y)
+            if tail and tail.strip() and len(tail) >= len(full_text):
+                log.append(f"=> フォールバック RangeFromPoint 成功 長={len(tail)}")
+                return tail
 
-        # フォールバック2: 本文全体を読む
-        log.append("=> フォールバック 全文読み上げ")
-        return big_text
+        # フォールバック2: 再構成した本文全体を読む
+        log.append(f"=> フォールバック 全文読み上げ 長={len(full_text)}")
+        return full_text
 
     @staticmethod
     def _anchor_line(pattern, x, y):
@@ -139,6 +166,68 @@ class TextCapturer(threading.Thread):
             pass
         try:
             return (r.GetText(ANCHOR_MAX) or "").strip()
+        except Exception:
+            return ""
+
+    # ---- 子孫走査による本文再構成(Electron/Chromium 系向け) ----
+
+    def _aggregate_ancestors(self, ancestors, log):
+        """祖先を下から上へ辿り、配下の TextControl 葉を集約した本文を返す。
+
+        上限(BLOCK_MAX)を超えたら会話ペイン全体を掴んだとみなして打ち切り、
+        それ未満で最大の集約テキスト(=クリックしたメッセージ相当のまとまり)を採る。
+        """
+        best = ""
+        for node in ancestors:
+            agg = self._collect_descendant_text(node)
+            if len(agg) > BLOCK_MAX:
+                log.append(f"=> 集約 上限超過 len={len(agg)} で打ち切り")
+                break
+            if len(agg) > len(best):
+                best = agg
+        log.append(f"=> 集約 bestLen={len(best)}")
+        return best
+
+    def _collect_descendant_text(self, root):
+        """root 配下の TextControl 葉のテキストを文書順(前順走査)で連結する。"""
+        parts = []
+        state = {"nodes": 0, "chars": 0}
+        limit = BLOCK_MAX + ANCHOR_MAX  # 打ち切り判定用の余裕を持たせた上限
+
+        def walk(node, depth):
+            if node is None or depth > MAX_DESCEND:
+                return
+            if state["nodes"] >= MAX_NODES or state["chars"] > limit:
+                return
+            state["nodes"] += 1
+            try:
+                ctype = node.ControlTypeName
+            except Exception:
+                ctype = ""
+            try:
+                children = node.GetChildren()
+            except Exception:
+                children = []
+            # 子を持たない TextControl = テキストの実体(行/ラン)。ここだけ採る。
+            if ctype == "TextControl" and not children:
+                text = self._node_text(node)
+                if text:
+                    parts.append(text)
+                    state["chars"] += len(text) + 1
+                return
+            for child in children:
+                if state["nodes"] >= MAX_NODES or state["chars"] > limit:
+                    break
+                walk(child, depth + 1)
+
+        walk(root, 0)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _node_text(node):
+        """ノードの表示テキスト。Chromium 系では Name にランのテキストが入る。"""
+        try:
+            return (node.Name or "").strip()
         except Exception:
             return ""
 
