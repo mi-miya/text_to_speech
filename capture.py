@@ -18,17 +18,25 @@ import time
 
 import uiautomation as auto
 
-MAX_WALK_UP = 20      # TextPattern を探して親を辿る最大段数
+MAX_WALK_UP = 30      # TextPattern を探して親を辿る最大段数。Electron 系は入れ子が
+                      # 深く、20 だと本文全体を持つ DocumentControl(TextPattern あり)に
+                      # 届かないことがある。届かないと高速な「クリック位置→末尾」経路に
+                      # 乗れず、低速な子孫集約へ落ちて数秒かかっていた。
 ANCHOR_MAX = 400      # クリック行から採るアンカー文字数の上限
 
-# Electron/Chromium 系アプリ(Claude Desktop 等)は本文を 1 行ごとに別々の
-# TextControl へ分割し、親の GroupControl は TextPattern を持たない。そのため
-# 「最大の TextPattern コンテナ」を採ってもクリック行 1 行しか取れず、読み上げが
-# すぐ止まる。この場合は祖先配下の TextControl 葉を文書順にたどって本文を再構成する。
+# Electron/Chromium 系アプリ(Claude Desktop 等)は本文を 1 段落ごとに別々の
+# TextControl へ分割し、各段落が「その段落だけの小さな TextPattern」を持つ。親の
+# GroupControl は TextPattern を持たない。そのため「最大の TextPattern コンテナ」を
+# 採ってもクリックした 1 段落しか取れず、読み上げがすぐ止まる。この場合は祖先配下の
+# TextControl 葉を文書順にたどって、クリックしたメッセージ 1 件分の本文を再構成する。
 AGG_TRIGGER = 500     # TextPattern 本文がこれ未満なら子孫走査で本文を再構成する
-BLOCK_MAX = 20000     # 集約テキストの上限。会話ペイン全体の取り込みを防ぐ
+MESSAGE_MAX = 14000   # 1 メッセージとして許容する最大文字数。祖先の集約がこれを超えたら
+                      # 会話ペイン(複数メッセージ)に達したとみなし、直前の集約で確定する。
+BLOCK_MAX = 20000     # 集約テキストの絶対上限(暴走防止の安全弁)
 MAX_DESCEND = 40      # 子孫を辿る最大の深さ
 MAX_NODES = 6000      # 1 回の集約で走査するノード数の上限(暴走防止)
+AGG_STALL_MIN = 16    # 祖先を1段上がってもクリック行以降の増分がこれ未満なら「増えず」とみなす
+AGG_STALL_LEVELS = 2  # 増えない段がこれだけ続いたら親を辿るのを打ち切る
 
 DEBUG_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "capture_debug.log")
 
@@ -117,23 +125,32 @@ class TextCapturer(threading.Thread):
             near_pat = providers[0][1]  # クリック位置に最も近い要素で位置を特定
         log.append(f"=> providers={len(providers)} bigDocLen={len(big_text)}")
 
-        # TextPattern 本文が短すぎる(Electron 系で 1 行しか取れない)場合は、
-        # 祖先配下の TextControl 葉を集約して本文を再構成する。
+        # TextPattern 本文が短すぎる(Electron 系で 1 段落しか取れない)場合は、
+        # 祖先配下の TextControl 葉を集約してメッセージ本文を再構成する。
         full_text = big_text
+        use_aggregate = False
+        anchor = ""
         if len(big_text) < AGG_TRIGGER:
-            agg_text = self._aggregate_ancestors(ancestors, log)
+            # 集約の打ち切り判定に使うため、アンカー(クリック行)を先に取っておく
+            anchor = self._anchor_line(near_pat, x, y) if near_pat else ""
+            agg_text = self._aggregate_ancestors(ancestors, anchor, log)
             if len(agg_text) > len(full_text):
                 full_text = agg_text
+                use_aggregate = True
 
         if not full_text:
             log.append("=> テキスト取得できず")
             return None
 
-        # TextPattern を持つアプリ(ブラウザ / VSCode 等)は、クリック位置(行頭)から
-        # 文書末尾までを直接切り出すのが最も確実。全文取得+アンカー照合は、文書が
+        # 大きな TextPattern 文書コンテナ(ブラウザ / VSCode 等)は、クリック位置(行頭)
+        # から文書末尾までを直接切り出すのが最も確実。全文取得+アンカー照合は、文書が
         # max_chars を超えると頭が切れてクリック行を取り込めず、先頭から読み直して
         # しまう(長い会話の途中をクリックすると上から読み始める症状の正体)。
-        if big_pat is not None:
+        #
+        # ただし Electron 系のように big_pat が「1 段落だけの小さな TextPattern」の場合は
+        # この経路に乗せてはいけない。乗せると 1 段落しか返らず読み上げが途中で止まる。
+        # その場合は集約した本文の方が正しいので、下のアンカー方式へ回す。
+        if big_pat is not None and not use_aggregate:
             tail = self._range_from_point_to_end(big_pat, x, y)
             if tail and tail.strip():
                 log.append(f"=> クリック位置→末尾 成功 長={len(tail)}")
@@ -142,7 +159,8 @@ class TextCapturer(threading.Thread):
 
         # アンカー方式: クリックした行を目印に、再構成した本文中の開始位置を求める
         # (TextPattern を持たない Electron 系アプリ向け)
-        anchor = self._anchor_line(near_pat, x, y) if near_pat else ""
+        if not anchor and near_pat is not None:
+            anchor = self._anchor_line(near_pat, x, y)
         if not anchor and big_pat is not None:
             anchor = self._anchor_line(big_pat, x, y)
         if not anchor:
@@ -180,39 +198,72 @@ class TextCapturer(threading.Thread):
 
     # ---- 子孫走査による本文再構成(Electron/Chromium 系向け) ----
 
-    def _aggregate_ancestors(self, ancestors, log):
-        """祖先を下から上へ辿り、クリックしたメッセージ相当の最小ブロックを返す。
+    def _aggregate_ancestors(self, ancestors, anchor, log):
+        """祖先を下から上へ辿り、クリックしたメッセージ 1 件分の本文を返す。
 
-        メッセージ内の入れ子ラッパは同程度のテキスト量が続く“踊り場”を作り、
-        会話ペイン(=複数メッセージ)に達すると量が急増する。その急増の直前を
-        1 メッセージ分のまとまりとみなして採用する。
+        祖先の部分木は親へ行くほどテキスト量が増える。1 メッセージのうちは
+        MESSAGE_MAX に収まり、会話ペイン(=複数メッセージ)に達すると一気に
+        超える。そこで「MESSAGE_MAX を超えない範囲で最大の集約」を採用する。
+        これは MESSAGE_MAX 以内に収まる最も外側の祖先(=メッセージ全体を包む
+        コンテナ)の全文にあたる。
 
-        急増レベルの走査は「確定済み best の 2 倍強」で打ち切るため、会話ペイン
-        全体を最後まで走査せずに済み、Electron 系でも高速に決定できる。
+        高速化のため、1 段下の祖先の走査結果を RuntimeId 照合でキャッシュ流用する
+        (旧実装は段ごとに部分木全体を再走査していて、これが取得に数秒かかる主因)。
+        さらに、アンカー(クリック行)より後ろ=実際に読み上げる部分が
+        AGG_STALL_LEVELS 段続けて増えなくなったら、それ以上親を辿っても読み上げ
+        内容は変わらないので打ち切る。これはウィンドウ外周の UI 文言(入力欄の
+        プレースホルダ等)が読み上げ末尾に混ざるのを防ぐ効果もある。
         """
         best = ""
+        best_tail = 0    # アンカー以降の長さ = 実際に読み上げる部分の長さ
+        stalls = 0
+        prev_id = None   # 1 段下の祖先の RuntimeId(キャッシュ照合キー)
+        prev_cache = None  # その部分木の走査結果 (parts, nodes)
         for depth, node in enumerate(ancestors):
-            # best が決まっていれば、その 2 倍強を超える量は「別メッセージも含む
-            # 上位コンテナ(会話ペイン)」に達したと判断する。cap は走査の打ち切り
-            # 上限にも使うので、長い会話でもペイン全体を最後まで走査しない。
-            cap = min(BLOCK_MAX, max(AGG_TRIGGER, len(best) * 2 + AGG_TRIGGER))
-            agg = self._collect_descendant_text(node, cap)
-            log.append(f"  集約[{depth}] len={len(agg)} cap={cap}")
-            if len(agg) > cap:
-                # 量が急増 = クリックしたメッセージの外側に到達。直前の best
-                # (1 メッセージ分)を採用し、会話全体を走査せずに打ち切る。
-                log.append(f"=> 集約 急増検出 → bestLen={len(best)} で確定")
+            parts, nodes = self._collect_descendant_text(
+                node, MESSAGE_MAX, prev_id, prev_cache)
+            agg = "\n".join(parts)
+            log.append(f"  集約[{depth}] len={len(agg)} nodes={nodes}")
+            if len(agg) > MESSAGE_MAX:
+                # 1 メッセージの上限を超えた = 会話ペイン(複数メッセージ)へ到達。
+                # 直前の best(メッセージ 1 件分)を採用して打ち切る。
+                log.append(f"=> 集約 上限超過(会話ペイン到達)→ bestLen={len(best)} で確定")
                 break
             if len(agg) > len(best):
                 best = agg
+            try:
+                prev_id = node.GetRuntimeId()
+            except Exception:
+                prev_id = None
+            prev_cache = (parts, nodes)
+            if anchor and len(best) >= AGG_TRIGGER:
+                idx = _find_anchor(best, anchor)
+                if idx >= 0:
+                    tail = len(best) - idx
+                    if tail - best_tail < AGG_STALL_MIN:
+                        stalls += 1
+                        if stalls >= AGG_STALL_LEVELS:
+                            log.append(f"=> 集約 読み上げ部分が増えないため {depth} 段で打ち切り")
+                            break
+                    else:
+                        stalls = 0
+                    best_tail = max(best_tail, tail)
         log.append(f"=> 集約 bestLen={len(best)}")
         return best
 
-    def _collect_descendant_text(self, root, char_limit=BLOCK_MAX):
-        """root 配下の TextControl 葉のテキストを文書順(前順走査)で連結する。
+    def _collect_descendant_text(self, root, char_limit=BLOCK_MAX,
+                                 prev_id=None, prev_cache=None):
+        """root 配下の TextControl 葉のテキストを文書順(前順走査)で集める。
 
         char_limit を超えたら走査を打ち切る。呼び出し側が小さい上限を渡すことで、
         会話ペイン全体のような巨大な部分木を最後まで走査せず高速に判定できる。
+
+        prev_id / prev_cache には 1 段下の祖先(root の直接の子のはず)の
+        RuntimeId と走査結果を渡す。一致した子は再走査せず結果を流用するので、
+        祖先を何段辿っても各ノードの走査は全体で 1 回で済む。照合の COM 呼び出しは
+        root の直接の子(depth==1)に限定してコストを抑える。
+
+        戻り値は (テキスト片のリスト, 走査ノード数)。
         """
         parts = []
         state = {"nodes": 0, "chars": 0}
@@ -223,21 +274,33 @@ class TextCapturer(threading.Thread):
                 return
             if state["nodes"] >= MAX_NODES or state["chars"] > limit:
                 return
+            if depth == 1 and prev_id is not None:
+                try:
+                    if node.GetRuntimeId() == prev_id:
+                        cached_parts, cached_nodes = prev_cache
+                        parts.extend(cached_parts)
+                        state["nodes"] += cached_nodes
+                        state["chars"] += sum(len(p) + 1 for p in cached_parts)
+                        return
+                except Exception:
+                    pass
             state["nodes"] += 1
-            try:
-                ctype = node.ControlTypeName
-            except Exception:
-                ctype = ""
             try:
                 children = node.GetChildren()
             except Exception:
                 children = []
             # 子を持たない TextControl = テキストの実体(行/ラン)。ここだけ採る。
-            if ctype == "TextControl" and not children:
-                text = self._node_text(node)
-                if text:
-                    parts.append(text)
-                    state["chars"] += len(text) + 1
+            # ControlTypeName も COM 呼び出しなので、葉と分かってから確認する。
+            if not children:
+                try:
+                    ctype = node.ControlTypeName
+                except Exception:
+                    ctype = ""
+                if ctype == "TextControl":
+                    text = self._node_text(node)
+                    if text:
+                        parts.append(text)
+                        state["chars"] += len(text) + 1
                 return
             for child in children:
                 if state["nodes"] >= MAX_NODES or state["chars"] > limit:
@@ -245,7 +308,7 @@ class TextCapturer(threading.Thread):
                 walk(child, depth + 1)
 
         walk(root, 0)
-        return "\n".join(parts)
+        return parts, state["nodes"]
 
     @staticmethod
     def _node_text(node):
