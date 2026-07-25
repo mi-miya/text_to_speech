@@ -9,6 +9,11 @@
 クリックした行のテキストを目印(アンカー)として全文中から探し、
 そこから末尾までを読み上げる。アンカーが見つからないときは全文を読む。
 
+クリック位置の特定には RangeFromPoint を使うが、この API が返す位置はアプリに
+よってずれる(X のように本文ブロック先頭が返り、どこをクリックしても投稿の先頭
+から読み上げてしまう)。そこで結果を鵜呑みにせず、行の外接矩形が実際にクリック
+座標を含むかを検証して補正する(_line_range_at_point / _refine_to_click_line)。
+
 デバッグ用に、直近の取得内容を capture_debug.log(毎回上書き)に残す。
 """
 import os
@@ -38,8 +43,13 @@ MAX_NODES = 6000      # 1 回の集約で走査するノード数の上限(暴�
 AGG_STALL_MIN = 16    # 祖先を1段上がってもクリック行以降の増分がこれ未満なら「増えず」とみなす
 AGG_STALL_LEVELS = 2  # 増えない段がこれだけ続いたら親を辿るのを打ち切る
 
+# RangeFromPoint の位置ずれを矩形照合で補正する際、クリック行を探して行単位で
+# 移動できる最大行数。Chromium 系では要素の先頭が返るため、要素が長いほど遠くなる。
+LINE_SEEK_MAX = 512
+
 DEBUG_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "capture_debug.log")
 
+Start = auto.TextPatternRangeEndpoint.Start
 End = auto.TextPatternRangeEndpoint.End
 
 
@@ -132,7 +142,7 @@ class TextCapturer(threading.Thread):
         anchor = ""
         if len(big_text) < AGG_TRIGGER:
             # 集約の打ち切り判定に使うため、アンカー(クリック行)を先に取っておく
-            anchor = self._anchor_line(near_pat, x, y) if near_pat else ""
+            anchor = self._anchor_line(near_pat, x, y, log) if near_pat else ""
             agg_text = self._aggregate_ancestors(ancestors, anchor, log)
             if len(agg_text) > len(full_text):
                 full_text = agg_text
@@ -151,7 +161,7 @@ class TextCapturer(threading.Thread):
         # この経路に乗せてはいけない。乗せると 1 段落しか返らず読み上げが途中で止まる。
         # その場合は集約した本文の方が正しいので、下のアンカー方式へ回す。
         if big_pat is not None and not use_aggregate:
-            tail = self._range_from_point_to_end(big_pat, x, y)
+            tail = self._range_from_point_to_end(big_pat, x, y, log)
             if tail and tail.strip():
                 log.append(f"=> クリック位置→末尾 成功 長={len(tail)}")
                 return tail
@@ -160,9 +170,9 @@ class TextCapturer(threading.Thread):
         # アンカー方式: クリックした行を目印に、再構成した本文中の開始位置を求める
         # (TextPattern を持たない Electron 系アプリ向け)
         if not anchor and near_pat is not None:
-            anchor = self._anchor_line(near_pat, x, y)
+            anchor = self._anchor_line(near_pat, x, y, log)
         if not anchor and big_pat is not None:
-            anchor = self._anchor_line(big_pat, x, y)
+            anchor = self._anchor_line(big_pat, x, y, log)
         if not anchor:
             anchor = self._node_text(control)  # クリックした要素自身のテキスト
         log.append(f"=> anchor={anchor[:40]!r}")
@@ -178,23 +188,219 @@ class TextCapturer(threading.Thread):
         log.append(f"=> フォールバック 全文読み上げ 長={len(full_text)}")
         return full_text
 
-    @staticmethod
-    def _anchor_line(pattern, x, y):
-        """クリック位置の1行分のテキストを返す(位置特定の目印)。"""
+    # ---- クリック位置の行を特定する(全アプリ共通の要) ----
+
+    def _line_range_at_point(self, pattern, x, y, log=None):
+        """クリック位置の「行」を表す TextRange を返す。
+
+        RangeFromPoint + ExpandToEnclosingUnit(Line) は建前上「クリック座標の 1 行」
+        を返すが、アプリによっては本文ブロックの先頭やブロック全体が返る。X の
+        タイムラインがこれで、本文のどこをクリックしても投稿の先頭から読み上げて
+        しまう。本文がリンクやハッシュタグで複数要素に割れている投稿だけ、たまたま
+        途中の要素が返って「途中から読める」— 同じような文面でも挙動が分かれる理由。
+
+        どの API がずれるかはアプリ次第なので、返ってきた範囲を信用せず
+        「外接矩形が実際にクリック座標を含むか」で検証し、ずれていれば直す:
+
+          1. 矩形がクリック位置を含まない → 行単位で移動して合致する行を探す
+          2. 矩形が複数行ぶんある(=範囲が 1 行になっていない)
+             → _refine_to_click_line が文字単位でクリック行の先頭まで切り詰める
+
+        矩形は画面座標なので判定は確実で、標準の TextPattern API だけで完結する。
+        特定サイト向けの細工にならず、TextPattern を持つどのアプリでも同じに効く。
+
+        探索は指数的に範囲を広げて挟み込み → 二分探索、で行う(先頭から 1 行ずつ
+        辿ると長い本文で COM 呼び出しが嵩み、読み上げ開始が遅れるため)。
+        """
         try:
-            r = pattern.RangeFromPoint(x, y)
+            seed = pattern.RangeFromPoint(x, y)
         except Exception:
-            return ""
+            return None
+        if seed is None:
+            return None
+        try:
+            seed.ExpandToEnclosingUnit(auto.TextUnit.Line, waitTime=0)
+        except Exception:
+            pass
+
+        probes = [0]
+
+        def line_at(offset):
+            """seed から offset 行移動した行の (range, 位置関係, 実移動行数)。
+
+            位置関係は _range_side と同じ符号(0=クリック行, 他=進むべき向き)。
+            """
+            probes[0] += 1
+            try:
+                r = seed.Clone()
+            except Exception:
+                return None, None, 0
+            moved = offset
+            if offset:
+                try:
+                    moved = r.Move(auto.TextUnit.Line, offset, waitTime=0)
+                except Exception:
+                    return None, None, 0
+                try:
+                    r.ExpandToEnclosingUnit(auto.TextUnit.Line, waitTime=0)
+                except Exception:
+                    pass
+            return r, _range_side(r, y), moved
+
+        if log is not None:
+            # 診断情報の取得で本処理を巻き添えにしない
+            try:
+                rects = _rects(seed)
+                span = (f"{min(r.top for r in rects)}..{max(r.bottom for r in rects)}"
+                        if rects else "なし")
+                head = (seed.GetText(24) or "").replace("\n", "/")
+                log.append(f"  行候補: clickY={y} 矩形{len(rects)}個 y範囲={span} "
+                           f"先頭={head!r}")
+            except Exception as e:
+                log.append(f"  行候補: 診断取得失敗 {type(e).__name__}")
+
+        side = _range_side(seed, y)
+        if side == 0:
+            if log is not None:
+                log.append("=> 行特定: RangeFromPoint の行がクリック位置と一致")
+            return self._refine_to_click_line(seed, y, log)
+        # 矩形が取れない(行が画面外)場合、Chromium 系では seed は要素先頭 =
+        # クリック位置より前にあるのが通例なので、前方へ進みながら探す。
+        if side is None:
+            side = 1
+
+        # 1) クリック位置を跨ぐまで移動幅を倍々にして挟み込む。
+        # Move は文書端で丸められる(要求 64 行に対し 59 行しか動かない等)ので、
+        # 要求値ではなく実移動量を区間の端として使う。要求値のまま打ち切ると、
+        # 文書末尾付近のクリックで挟み込みに失敗し手前の行で確定してしまう。
+        near, far = 0, side
+        bracketed = False
+        while abs(far) <= LINE_SEEK_MAX:
+            r, s, moved = line_at(far)
+            if r is None:
+                break
+            if s == 0:
+                if log is not None:
+                    log.append(f"=> 行特定: {moved} 行移動で一致 (探索{probes[0]}回)")
+                return self._refine_to_click_line(r, y, log)
+            if s is not None and s != side:
+                far = moved        # 跨いだ = [near, far] の間にクリック行がある
+                bracketed = True
+                break
+            near = moved
+            if moved != far:
+                break              # 文書端に達した = これ以上その向きへは動けない
+            far *= 2
+
+        # 2) 挟み込めた区間を二分してクリック行に寄せる
+        if bracketed:
+            while abs(far - near) > 1:
+                mid = near + (far - near) // 2
+                r, s, moved = line_at(mid)
+                if r is None or s is None or moved != mid:
+                    break
+                if s == 0:
+                    if log is not None:
+                        log.append(f"=> 行特定: {mid} 行移動で一致 (探索{probes[0]}回)")
+                    return self._refine_to_click_line(r, y, log)
+                if s == side:
+                    near = mid
+                else:
+                    far = mid
+
+        # どの行の矩形にも入らない(行間の余白やパディングをクリックした)場合は、
+        # 文書順でクリック位置の直前にある行を採る。読み始めが手前にずれるだけで、
+        # クリックした箇所を読み飛ばすことがない。
+        final = near if side > 0 else (far if bracketed else near)
+        r, _, _ = line_at(final)
+        if log is not None:
+            log.append(f"=> 行特定: {final} 行移動で確定(矩形一致なし 探索{probes[0]}回)")
+        return self._refine_to_click_line(r or seed, y, log)
+
+    def _refine_to_click_line(self, text_range, y, log=None):
+        """複数行にまたがる範囲を、クリック行の先頭から始まる範囲に切り詰める。
+
+        ExpandToEnclosingUnit(Line) は「1 行」に正規化してくれる建前だが、実装に
+        よっては段落やブロック全体を返す。その場合、外接矩形はブロック全体を覆う
+        ため「クリック位置を含む」判定になってしまい、矩形照合だけでは是正できない
+        (どこをクリックしてもブロック先頭から読み上げてしまう)。
+
+        そこで、矩形が複数行ぶん返ってきた=範囲が複数行にまたがっていると判断し、
+        Line 単位に頼らず文字単位の二分探索でクリック行の先頭文字を割り出す。
+        矩形は画面座標なので、行の概念がアプリごとにどうであれ結果は同じになる。
+        """
+        rects = _rects(text_range)
+        if len(rects) <= 1:
+            return text_range          # すでに 1 行 → そのまま
+        try:
+            n = len(text_range.GetText(self._max_chars) or "")
+        except Exception:
+            return text_range
+        if n <= 1:
+            return text_range
+
+        # 先頭文字がすでにクリック行以降なら切り詰める必要はない
+        if self._char_side(text_range, 0, y) != 1:
+            return text_range
+
+        # 「クリック位置より上」でなくなる最初の文字位置を二分探索で求める。
+        # lo は常にクリック行より上、hi は常にクリック行以降、という不変条件を保つ。
+        lo, hi = 0, n
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            s = self._char_side(text_range, mid, y)
+            if s is None:
+                break
+            if s == 1:
+                lo = mid
+            else:
+                hi = mid
+
+        r = self._char_start_range(text_range, hi)
+        if r is None:
+            return text_range
+        if log is not None:
+            log.append(f"=> 行特定: 範囲が{len(rects)}行ぶん → {hi}/{n} 文字目まで切り詰め")
+        return r
+
+    def _char_start_range(self, base, k):
+        """base の開始位置を k 文字進めた範囲を返す(終端は base のまま)。"""
+        try:
+            r = base.Clone()
+            if k and r.MoveEndpointByUnit(Start, auto.TextUnit.Character, k,
+                                          waitTime=0) != k:
+                return None
+            return r
+        except Exception:
+            return None
+
+    def _char_side(self, base, k, y):
+        """base の k 文字目とクリック位置の上下関係(_range_side と同じ符号)。"""
+        r = self._char_start_range(base, k)
+        if r is None:
+            return None
+        try:
+            # 1 文字ぶんの範囲にして、その文字の矩形を得る
+            r.MoveEndpointByRange(End, r, Start, waitTime=0)
+            r.MoveEndpointByUnit(End, auto.TextUnit.Character, 1, waitTime=0)
+        except Exception:
+            return None
+        return _range_side(r, y)
+
+    def _anchor_line(self, pattern, x, y, log=None):
+        """クリック位置の1行分のテキストを返す(位置特定の目印)。"""
+        r = self._line_range_at_point(pattern, x, y, log)
         if r is None:
             return ""
         try:
-            r.ExpandToEnclosingUnit(auto.TextUnit.Line, waitTime=0)
-        except Exception:
-            pass
-        try:
-            return (r.GetText(ANCHOR_MAX) or "").strip()
+            text = r.GetText(ANCHOR_MAX) or ""
         except Exception:
             return ""
+        # 範囲がクリック行以降すべてに及ぶことがあるので、先頭の 1 行だけを目印にする
+        for line in text.split("\n"):
+            if line.strip():
+                return line.strip()
+        return ""
 
     # ---- 子孫走査による本文再構成(Electron/Chromium 系向け) ----
 
@@ -318,21 +524,16 @@ class TextCapturer(threading.Thread):
         except Exception:
             return ""
 
-    def _range_from_point_to_end(self, pattern, x, y):
+    def _range_from_point_to_end(self, pattern, x, y, log=None):
         """クリック位置(行頭にそろえる)から文書末尾までのテキストを返す。
 
         全文取得+アンカー照合と違い、文書が max_chars を超えていても影響を受けず、
         クリック位置から前方へ最大 max_chars 分を確実に取得できる。
         """
+        r = self._line_range_at_point(pattern, x, y, log)
+        if r is None:
+            return ""
         try:
-            r = pattern.RangeFromPoint(x, y)
-            if r is None:
-                return ""
-            # 開始位置を行頭にそろえる(文の途中から読み始めないため)
-            try:
-                r.ExpandToEnclosingUnit(auto.TextUnit.Line, waitTime=0)
-            except Exception:
-                pass
             ok = r.MoveEndpointByRange(End, pattern.DocumentRange, End, waitTime=0)
             if not ok:
                 return ""
@@ -354,6 +555,38 @@ class TextCapturer(threading.Thread):
                 f.write("\n")
         except OSError:
             pass
+
+
+def _rects(text_range):
+    """範囲の外接矩形(画面座標)。取得できなければ空リスト。"""
+    try:
+        return text_range.GetBoundingRectangles() or []
+    except Exception:
+        return []
+
+
+def _range_side(text_range, y):
+    """行の外接矩形とクリック位置の上下関係を返す。
+
+    0  … 行がクリック位置を含む(=クリックした行)
+    1  … 行はクリック位置より上(前方へ進む必要がある)
+    -1 … 行はクリック位置より下(後方へ戻る必要がある)
+    None … 矩形が取れない(行が画面外など)ため判定できない
+
+    戻り値はそのまま「移動すべき向き」として使える符号になっている。
+    """
+    rects = _rects(text_range)
+    if not rects:
+        return None
+    top = min(r.top for r in rects)
+    bottom = max(r.bottom for r in rects)
+    if bottom <= top:
+        return None
+    if y < top:
+        return -1
+    if y >= bottom:
+        return 1
+    return 0
 
 
 def _find_anchor(full_text, anchor):
