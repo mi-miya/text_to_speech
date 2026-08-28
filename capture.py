@@ -1,32 +1,43 @@
-"""UI Automation でクリック位置から文書末尾までのテキストを取得する。
+"""UI Automation でクリック位置から「クリックした項目の終わり」までを取得する。
 
-段落の途中をクリックすると、その位置の要素が持つ TextPattern は
-「その行/ブロックだけ」を範囲とすることがあり、それが原因で読み上げが
-途中で止まっていた(見出しから始めると読める、という症状の正体)。
+取得は 3 段構えで、上から順に当たった経路を使う。
 
-対策として、クリック位置から親を辿って TextPattern を持つ祖先を集め、
-その中で「最も多くのテキストを含むコンテナ」の全文を採用する。さらに
-クリックした行のテキストを目印(アンカー)として全文中から探し、
-そこから末尾までを読み上げる。アンカーが見つからないときは全文を読む。
+1. 範囲切り出し (_read_to_boundary) — ブラウザ / VSCode など、本文全体を 1 つの
+   TextPattern 文書として持つアプリ向けの本命経路。
+     開始 = クリックされた要素 (ControlFromPoint) の範囲を出発点に、外接矩形を
+            クリック座標と突き合わせてクリック行まで寄せる。
+            座標→文字位置の RangeFromPoint は X のタイムラインのようにセルを
+            絶対配置で仮想スクロールする画面で別の投稿を指すことがあるため、
+            出発点には使わず、要素の範囲が取れないときのフォールバックに回す。
+     終了 = クリック位置を包む ARIA 項目 (role=article / listitem 等) の末尾。
+            タイムラインは全体で 1 つの巨大な文書なので、文書末尾まで読むと
+            後続の投稿やページのフッターまで読み上げてしまう。項目が無ければ
+            main、それも無ければ従来どおり文書末尾まで読む。
 
-クリック位置の特定には RangeFromPoint を使うが、この API が返す位置はアプリに
-よってずれる(X のように本文ブロック先頭が返り、どこをクリックしても投稿の先頭
-から読み上げてしまう)。そこで結果を鵜呑みにせず、行の外接矩形が実際にクリック
-座標を含むかを検証して補正する(_line_range_at_point / _refine_to_click_line)。
+2. 子孫集約 (_aggregate_ancestors) — Electron 系アプリは本文を段落ごとに別々の
+   TextControl へ分割し、各段落が「その段落だけの小さな TextPattern」を持つ。
+   1 の経路に乗せると 1 段落で読み上げが止まるので、祖先配下の TextControl 葉を
+   文書順にたどってメッセージ 1 件分の本文を再構成する。
+
+3. アンカー照合 — 再構成した本文の中から、クリックした行のテキストを目印に
+   開始位置を探す。見つからなければ本文全体を読む。
 
 デバッグ用に、直近の取得内容を capture_debug.log(毎回上書き)に残す。
 """
 import os
 import queue
+import re
 import threading
 import time
 
 import uiautomation as auto
 
-MAX_WALK_UP = 30      # TextPattern を探して親を辿る最大段数。Electron 系は入れ子が
-                      # 深く、20 だと本文全体を持つ DocumentControl(TextPattern あり)に
-                      # 届かないことがある。届かないと高速な「クリック位置→末尾」経路に
-                      # 乗れず、低速な子孫集約へ落ちて数秒かかっていた。
+MAX_WALK_UP = 60      # TextPattern を探して親を辿る最大段数。届かないと高速な
+                      # 「クリック位置→項目末尾」経路に乗れず、低速な子孫集約へ落ちる。
+                      # X の会話ビューは実測で本文の葉から DocumentControl まで 25 段、
+                      # ユーザー名のようにリンクの内側だと 33 段以上あり、30 では
+                      # 足りずに投稿の一部しか読めなくなっていた。1 段あたり COM 呼び
+                      # 出し 1 回(1ms 未満)なので、余裕を持たせても取得時間に響かない。
 ANCHOR_MAX = 400      # クリック行から採るアンカー文字数の上限
 
 # Electron/Chromium 系アプリ(Claude Desktop 等)は本文を 1 段落ごとに別々の
@@ -47,7 +58,25 @@ AGG_STALL_LEVELS = 2  # 増えない段がこれだけ続いたら親を辿る�
 # 移動できる最大行数。Chromium 系では要素の先頭が返るため、要素が長いほど遠くなる。
 LINE_SEEK_MAX = 512
 
+# 「クリックした 1 件」を包むノードを示す ARIA ロール。読み上げをこの範囲の終わりで
+# 止める。X のタイムラインは投稿ごとに role="article" が付くので、これで隣の投稿や
+# ページ末尾のフッター(利用規約 / (c) X Corp. 等)まで読み続けるのを防げる。
+# row / gridcell / treeitem は「1 行 1 セル」の構造ロールで、表やツリーの上で
+# クリックすると 1 行だけで読み上げが止まってしまうため、あえて入れていない。
+ITEM_ROLES = ("article", "listitem", "comment")
+DESCEND_BUDGET = 400  # クリック対象を矩形で降りて探すときに見る子ノード数の上限
+# Chromium はアクセシビリティツリーを遅延構築するため、ControlFromPoint や
+# RangeFromChild が一時的に不完全な結果を返すことがある(実測 40 回に 1 回程度)。
+# いずれも取り直すと解決するので、静かに劣化した経路へ落ちる前にやり直す。
+CLICK_TARGET_RETRY = 3  # クリック対象が葉に届くまでの取り直し回数
+RANGE_RETRY = 2         # RangeFromChild の取り直し回数
+# 項目ロールが無いページ向けの緩い境界。ヘッダ / ナビ / フッターを除ける。
+SECTION_ROLES = ("main",)
+
 DEBUG_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "capture_debug.log")
+DEBUG_KEEP = 8        # ログに残す直近の取得回数。1 回分だけだと「さっきの失敗」を
+                      # 追えないため履歴にする(区切りは DEBUG_SEP)。
+DEBUG_SEP = "=" * 60
 
 Start = auto.TextPatternRangeEndpoint.Start
 End = auto.TextPatternRangeEndpoint.End
@@ -79,25 +108,96 @@ class TextCapturer(threading.Thread):
                 except Exception as e:
                     text = None
                     lines.append(f"EXCEPTION: {type(e).__name__}: {e}")
+                text = _trim_trailing_ui(text)
                 elapsed = time.perf_counter() - started
                 lines.insert(0, f"取得所要時間={elapsed * 1000:.0f}ms")
                 self._write_debug(x, y, text, lines)
-                if text and text.strip():
+                # 画像やアイコンをクリックすると ￼ や数字だけが返る。読み上げても
+                # 無音になるだけなので、取得失敗として橙の点灯で知らせる。
+                if text and _has_letter(text):
                     self._on_text(text)
                 else:
                     self._on_error()
 
     # ---- テキスト取得本体 ----
 
+    def _resolve_click_target(self, control, x, y, log=None):
+        """クリック座標を含む最も深い子孫まで降りて、実際のクリック対象を返す。
+
+        Chromium はアクセシビリティツリーを遅延構築するため、ControlFromPoint が
+        葉ではなく DocumentControl のような粗いノードを返すことがある。そのまま
+        使うと祖先を辿っても項目境界 (role=article) に出会えず、開始位置も文書
+        先頭のナビゲーション部分になってしまう(タイムラインで関係ない場所から
+        読み上げが始まる原因のひとつ)。外接矩形はどのノードでも取れるので、
+        座標を含む子を選んで降りることで対象を確定させる。
+
+        既に葉が返っているときは GetChildren が空なので、その場で抜ける。
+
+        戻り値は (対象ノード, 降りた段数, 葉に到達したか)。葉に届かなかったときは
+        ツリーが構築途中の可能性が高いので、呼び出し側が取り直す判断に使う。
+        """
+        node = control
+        budget = DESCEND_BUDGET
+        depth = 0
+        while depth < MAX_DESCEND and budget > 0:
+            try:
+                children = node.GetChildren()
+            except Exception:
+                break
+            if not children:
+                break
+            best = None
+            best_area = None
+            for child in children:
+                budget -= 1
+                if budget <= 0:
+                    break
+                try:
+                    r = child.BoundingRectangle
+                except Exception:
+                    continue
+                if not (r.left <= x < r.right and r.top <= y < r.bottom):
+                    continue
+                # 座標を含む中で最も小さいものが、視覚的に最前面の要素
+                area = (r.right - r.left) * (r.bottom - r.top)
+                if best_area is None or area < best_area:
+                    best, best_area = child, area
+            if best is None:
+                break
+            node = best
+            depth += 1
+        try:
+            leaf = not node.GetChildren()
+        except Exception:
+            leaf = False
+        if depth and log is not None:
+            log.append(f"=> クリック対象を再特定: {depth} 段下降 → "
+                       f"{getattr(node, 'ControlTypeName', '?')}")
+        return node, depth, leaf
+
     def _extract(self, x, y, log):
-        control = auto.ControlFromPoint(x, y)
+        # Chromium はアクセシビリティツリーを遅延構築するため、ControlFromPoint が
+        # 葉ではなく DocumentControl を返すことがある(実測で 40 回に 1 回程度)。
+        # そのまま進むと文書全体を種にしてしまい、ページ先頭の隠しナビゲーション
+        # (「キーボードショートカットを表示」等)を読み上げてしまう。取り直せば
+        # 解決するので、葉に届くまで数回やり直す。
+        for attempt in range(CLICK_TARGET_RETRY):
+            control, descended, leaf = self._resolve_click_target(
+                auto.ControlFromPoint(x, y), x, y, log)
+            if leaf:
+                break
+            log.append(f"=> クリック対象が葉に届かず(試行{attempt + 1}) → 取り直す")
 
         # クリック位置から親へ辿り、TextPattern を持つ祖先をすべて集める。
         # あわせて祖先ノード自体も記録し、集約フォールバックの起点に使う。
+        # 同時に ARIA ロールを見て「クリックした 1 項目」を包む境界ノードを探す。
         providers = []   # (control, pattern, doc_text)
         ancestors = []   # クリック要素から上へ辿ったノード列
+        item = None      # (node, depth, role) 項目境界 (article / listitem 等)
+        section = None   # (node, depth, role) 緩い境界 (main)
         node = control
-        for depth in range(MAX_WALK_UP):
+        # 対象の再特定で下へ降りたぶん、上限も伸ばす(文書ノードまで届かせる)
+        for depth in range(MAX_WALK_UP + descended):
             if node is None:
                 break
             ancestors.append(node)
@@ -106,6 +206,15 @@ class TextCapturer(threading.Thread):
                 name = node.Name or ""
             except Exception:
                 pass
+            role = ""
+            try:
+                role = node.AriaRole or ""
+            except Exception:
+                role = ""
+            if item is None and role in ITEM_ROLES:
+                item = (node, depth, role)
+            if section is None and role in SECTION_ROLES:
+                section = (node, depth, role)
             pattern = None
             try:
                 pattern = node.GetPattern(auto.PatternId.TextPattern)
@@ -119,12 +228,19 @@ class TextCapturer(threading.Thread):
                     doc_text = ""
                 providers.append((node, pattern, doc_text))
             log.append(f"[{depth}] {getattr(node, 'ControlTypeName', '?')} "
-                       f"name={name[:30]!r} textPattern={'Y' if pattern else 'N'} "
-                       f"docLen={len(doc_text)}")
+                       f"name={name[:30]!r} role={role!r} "
+                       f"textPattern={'Y' if pattern else 'N'} docLen={len(doc_text)}")
             try:
                 node = node.GetParentControl()
             except Exception:
                 break
+
+        # 項目境界を優先。無ければ main、それも無ければ文書末尾まで読む。
+        boundary = item or section
+        if boundary is None:
+            log.append("=> 境界: なし (文書末尾まで)")
+        else:
+            log.append(f"=> 境界: [{boundary[1]}] role={boundary[2]!r}")
 
         # 最も多くのテキストを含む TextPattern コンテナ = 通常アプリの本文
         big_pat = None
@@ -135,6 +251,13 @@ class TextCapturer(threading.Thread):
             near_pat = providers[0][1]  # クリック位置に最も近い要素で位置を特定
         log.append(f"=> providers={len(providers)} bigDocLen={len(big_text)}")
 
+        # 「クリックした要素」が文書全体そのもの = クリック位置の手がかりが何も
+        # 無い状態。この状態でだけ、位置を特定できなければ取得失敗として扱う。
+        # (葉に届かなかっただけなら、余白のクリック等で従来どおり読める方がよい)
+        coarse = bool(not leaf and providers and providers[0][1] is big_pat)
+        if coarse:
+            log.append("=> 注意: クリック要素が文書全体(位置の手がかり無し)")
+
         # TextPattern 本文が短すぎる(Electron 系で 1 段落しか取れない)場合は、
         # 祖先配下の TextControl 葉を集約してメッセージ本文を再構成する。
         full_text = big_text
@@ -143,7 +266,9 @@ class TextCapturer(threading.Thread):
         if len(big_text) < AGG_TRIGGER:
             # 集約の打ち切り判定に使うため、アンカー(クリック行)を先に取っておく
             anchor = self._anchor_line(near_pat, x, y, log) if near_pat else ""
-            agg_text = self._aggregate_ancestors(ancestors, anchor, log)
+            # 境界が分かっているならそこで祖先辿りを止める(隣の項目を巻き込まない)
+            scope = ancestors if boundary is None else ancestors[:boundary[1] + 1]
+            agg_text = self._aggregate_ancestors(scope, anchor, log)
             if len(agg_text) > len(full_text):
                 full_text = agg_text
                 use_aggregate = True
@@ -153,7 +278,7 @@ class TextCapturer(threading.Thread):
             return None
 
         # 大きな TextPattern 文書コンテナ(ブラウザ / VSCode 等)は、クリック位置(行頭)
-        # から文書末尾までを直接切り出すのが最も確実。全文取得+アンカー照合は、文書が
+        # から境界の末尾までを直接切り出すのが最も確実。全文取得+アンカー照合は、文書が
         # max_chars を超えると頭が切れてクリック行を取り込めず、先頭から読み直して
         # しまう(長い会話の途中をクリックすると上から読み始める症状の正体)。
         #
@@ -161,11 +286,18 @@ class TextCapturer(threading.Thread):
         # この経路に乗せてはいけない。乗せると 1 段落しか返らず読み上げが途中で止まる。
         # その場合は集約した本文の方が正しいので、下のアンカー方式へ回す。
         if big_pat is not None and not use_aggregate:
-            tail = self._range_from_point_to_end(big_pat, x, y, log)
+            tail = self._read_to_boundary(
+                big_pat, control, boundary[0] if boundary else None, x, y,
+                coarse=coarse, log=log)
             if tail and tail.strip():
-                log.append(f"=> クリック位置→末尾 成功 長={len(tail)}")
+                log.append(f"=> クリック位置→境界末尾 成功 長={len(tail)}")
                 return tail
-            log.append("=> RangeFromPoint 取得できず → アンカー方式へ")
+            if coarse:
+                # 位置の根拠が無いまま全文フォールバックへ進むと、クリックと無関係な
+                # ページ先頭から読み上げてしまう。ここで失敗にする。
+                log.append("=> クリック対象を特定できないため取得失敗とする")
+                return None
+            log.append("=> 範囲切り出しできず → アンカー方式へ")
 
         # アンカー方式: クリックした行を目印に、再構成した本文中の開始位置を求める
         # (TextPattern を持たない Electron 系アプリ向け)
@@ -190,8 +322,8 @@ class TextCapturer(threading.Thread):
 
     # ---- クリック位置の行を特定する(全アプリ共通の要) ----
 
-    def _line_range_at_point(self, pattern, x, y, log=None):
-        """クリック位置の「行」を表す TextRange を返す。
+    def _line_range_at_point(self, pattern, x, y, log=None, seed=None):
+        """クリック位置の「行」を表す (TextRange, 矩形で特定できたか) を返す。
 
         RangeFromPoint + ExpandToEnclosingUnit(Line) は建前上「クリック座標の 1 行」
         を返すが、アプリによっては本文ブロックの先頭やブロック全体が返る。X の
@@ -212,12 +344,21 @@ class TextCapturer(threading.Thread):
         探索は指数的に範囲を広げて挟み込み → 二分探索、で行う(先頭から 1 行ずつ
         辿ると長い本文で COM 呼び出しが嵩み、読み上げ開始が遅れるため)。
         """
-        try:
-            seed = pattern.RangeFromPoint(x, y)
-        except Exception:
-            return None
+        # seed は探索の出発点となる範囲。呼び出し側がクリックした要素の範囲を
+        # 渡してきたときはそれを使う(RangeFromPoint より確実。理由は
+        # _read_to_boundary のコメント参照)。渡されなければ座標から求める。
         if seed is None:
-            return None
+            try:
+                seed = pattern.RangeFromPoint(x, y)
+            except Exception:
+                return None, False
+        else:
+            try:
+                seed = seed.Clone()   # 呼び出し側の範囲を壊さない
+            except Exception:
+                seed = None
+        if seed is None:
+            return None, False
         try:
             seed.ExpandToEnclosingUnit(auto.TextUnit.Line, waitTime=0)
         except Exception:
@@ -263,7 +404,7 @@ class TextCapturer(threading.Thread):
         if side == 0:
             if log is not None:
                 log.append("=> 行特定: RangeFromPoint の行がクリック位置と一致")
-            return self._refine_to_click_line(seed, y, log)
+            return self._refine_to_click_line(seed, y, log), True
         # 矩形が取れない(行が画面外)場合、Chromium 系では seed は要素先頭 =
         # クリック位置より前にあるのが通例なので、前方へ進みながら探す。
         if side is None:
@@ -282,7 +423,7 @@ class TextCapturer(threading.Thread):
             if s == 0:
                 if log is not None:
                     log.append(f"=> 行特定: {moved} 行移動で一致 (探索{probes[0]}回)")
-                return self._refine_to_click_line(r, y, log)
+                return self._refine_to_click_line(r, y, log), True
             if s is not None and s != side:
                 far = moved        # 跨いだ = [near, far] の間にクリック行がある
                 bracketed = True
@@ -302,7 +443,7 @@ class TextCapturer(threading.Thread):
                 if s == 0:
                     if log is not None:
                         log.append(f"=> 行特定: {mid} 行移動で一致 (探索{probes[0]}回)")
-                    return self._refine_to_click_line(r, y, log)
+                    return self._refine_to_click_line(r, y, log), True
                 if s == side:
                     near = mid
                 else:
@@ -315,7 +456,7 @@ class TextCapturer(threading.Thread):
         r, _, _ = line_at(final)
         if log is not None:
             log.append(f"=> 行特定: {final} 行移動で確定(矩形一致なし 探索{probes[0]}回)")
-        return self._refine_to_click_line(r or seed, y, log)
+        return self._refine_to_click_line(r or seed, y, log), False
 
     def _refine_to_click_line(self, text_range, y, log=None):
         """複数行にまたがる範囲を、クリック行の先頭から始まる範囲に切り詰める。
@@ -389,7 +530,7 @@ class TextCapturer(threading.Thread):
 
     def _anchor_line(self, pattern, x, y, log=None):
         """クリック位置の1行分のテキストを返す(位置特定の目印)。"""
-        r = self._line_range_at_point(pattern, x, y, log)
+        r, _ = self._line_range_at_point(pattern, x, y, log)
         if r is None:
             return ""
         try:
@@ -524,18 +665,94 @@ class TextCapturer(threading.Thread):
         except Exception:
             return ""
 
-    def _range_from_point_to_end(self, pattern, x, y, log=None):
-        """クリック位置(行頭にそろえる)から文書末尾までのテキストを返す。
+    @staticmethod
+    def _range_from_child(pattern, child):
+        """pattern の文書内で child 要素が占める TextRange を返す。
 
-        全文取得+アンカー照合と違い、文書が max_chars を超えていても影響を受けず、
-        クリック位置から前方へ最大 max_chars 分を確実に取得できる。
+        座標に頼らず要素そのものから範囲を得るので、位置ずれの影響を受けない。
+        (uiautomation の TextPattern.RangeFromChild は引数を無視して呼ぶ不具合が
+        あるため、生の COM インターフェースを直接呼ぶ。)
         """
-        r = self._line_range_at_point(pattern, x, y, log)
+        if pattern is None or child is None:
+            return None
+        for _ in range(RANGE_RETRY):
+            try:
+                raw = pattern.pattern.RangeFromChild(child.Element)
+            except Exception:
+                raw = None
+            if not raw:
+                continue
+            try:
+                return auto.TextRange(textRange=raw)
+            except Exception:
+                return None
+        return None
+
+    def _read_to_boundary(self, pattern, control, boundary, x, y,
+                          coarse=False, log=None):
+        """クリック位置(行頭にそろえる)から、クリックした項目の末尾までを返す。
+
+        開始位置: RangeFromPoint(座標→文字位置)は、X のタイムラインのように
+        セルを絶対配置で仮想スクロールする画面では別の投稿を指すことがある
+        (クリックした投稿と無関係な行から読み始める症状の正体)。そこで
+        ControlFromPoint で得た「実際にクリックされた要素」の範囲を探索の出発点に
+        使い、そこから矩形照合でクリック行へ寄せる。座標ヒットテストは、要素の
+        範囲が取れなかったときのフォールバックに下げる。
+
+        終了位置: boundary(role=article / listitem 等)があればその末尾で止める。
+        タイムラインは全体で 1 つの巨大な文書なので、文書末尾まで読むと後続の投稿や
+        ページのフッターまで読み上げてしまう。boundary が無ければ従来どおり文書末尾
+        まで読む。
+        """
+        # 要素の範囲を種にする。矩形が一時的に取れないことがある(ツリー構築中)ので、
+        # その場合だけ取り直す。矩形が取れていて位置が違うなら、それは本当に別の
+        # 場所なので取り直さず座標探索へ回す。
+        seed = None
+        for attempt in range(RANGE_RETRY):
+            cand = self._range_from_child(pattern, control)
+            if cand is None:
+                continue
+            side = _range_side(cand, y)
+            if side == 0:
+                seed = cand
+                break
+            if side is None:
+                if log is not None:
+                    log.append(f"  開始種: 要素範囲の矩形が取れず(試行{attempt + 1})")
+                continue
+            if log is not None:
+                log.append("  開始種: 要素範囲がクリック位置を含まず → 座標から探索")
+            break
+        if log is not None:
+            log.append("  開始種: クリックした要素の範囲を使用" if seed is not None
+                       else "  開始種: 座標から探索")
+        r, matched = self._line_range_at_point(pattern, x, y, log, seed=seed)
         if r is None:
             return ""
+        # 粗いノード(文書全体)を種にしたうえ矩形でも行を特定できていないなら、
+        # 読み始めの位置に根拠が無い。そのまま読むとページ先頭の隠しナビから
+        # 読み上げてしまうので、取得失敗として扱う(橙の点灯で知らせる)。
+        if coarse and not matched:
+            if log is not None:
+                log.append("=> クリック位置を特定できず(粗いノード+矩形不一致)→ 取得失敗")
+            return ""
+
+        end_range = self._range_from_child(pattern, boundary)
+        if end_range is not None:
+            try:
+                clipped = r.Clone()
+                if clipped.MoveEndpointByRange(End, end_range, End, waitTime=0):
+                    text = clipped.GetText(self._max_chars) or ""
+                    if text.strip():
+                        if log is not None:
+                            log.append(f"  終端: 項目境界まで 長={len(text)}")
+                        return text
+            except Exception:
+                pass
+            if log is not None:
+                log.append("  終端: 項目境界を適用できず → 文書末尾まで")
         try:
-            ok = r.MoveEndpointByRange(End, pattern.DocumentRange, End, waitTime=0)
-            if not ok:
+            if not r.MoveEndpointByRange(End, pattern.DocumentRange, End, waitTime=0):
                 return ""
             return r.GetText(self._max_chars) or ""
         except Exception:
@@ -544,15 +761,26 @@ class TextCapturer(threading.Thread):
     def _write_debug(self, x, y, text, log):
         if not self._debug:
             return
+        stamp = time.strftime("%H:%M:%S")
+        entry = [f"{DEBUG_SEP}\n[{stamp}] click=({x},{y})",
+                 "\n".join(log),
+                 "\n--- 取得テキスト先頭200字 ---",
+                 (text or "")[:200],
+                 "--- 末尾100字 ---",
+                 (text or "")[-100:], ""]
         try:
+            try:
+                with open(DEBUG_LOG, "r", encoding="utf-8") as f:
+                    past = f.read()
+            except OSError:
+                past = ""
+            # 直近 DEBUG_KEEP 回分だけ残す(区切りで切り出して古い方を捨てる)
+            chunks = past.split(DEBUG_SEP)[1:]
+            chunks = chunks[-(DEBUG_KEEP - 1):] if DEBUG_KEEP > 1 else []
             with open(DEBUG_LOG, "w", encoding="utf-8") as f:
-                f.write(f"click=({x},{y})\n")
-                f.write("\n".join(log))
-                f.write("\n\n--- 取得テキスト先頭200字 ---\n")
-                f.write((text or "")[:200])
-                f.write("\n--- 末尾100字 ---\n")
-                f.write((text or "")[-100:])
-                f.write("\n")
+                for c in chunks:
+                    f.write(DEBUG_SEP + c)
+                f.write("\n".join(entry))
         except OSError:
             pass
 
@@ -587,6 +815,47 @@ def _range_side(text_range, y):
     if y >= bottom:
         return 1
     return 0
+
+
+def _has_letter(text):
+    """文字(言語は問わない)を 1 つでも含むか。
+
+    数字・記号・￼(埋め込みオブジェクトの代替文字)だけの塊は、読み上げても
+    意味を成さない UI の断片。本文の行は必ず文字を含むので、これで見分ける。
+    """
+    return any(ch.isalpha() for ch in text)
+
+
+# 件数表示だけの行(1,946 / 3.5万 / 1.2K など)。単位の万・千・億・K/M/B は
+# 文字なので _has_letter では弾けず、これが無いと「3.5万」で削除が止まってしまう。
+_COUNT_LINE = re.compile("^[\\s\\d.,%\uFFFC\u4e07\u5343\u5104\u5146KMBkmb]+$")
+
+
+def _is_ui_noise(line):
+    """本文ではない行(カウンタ表示や記号だけの行)か。"""
+    if not _has_letter(line):
+        return True                        # 数字・記号・￼ だけの行
+    return bool(_COUNT_LINE.match(line))   # 3.5万 / 1.2K のような件数表示
+
+
+def _trim_trailing_ui(text):
+    """末尾に続く UI の断片(返信 / リポスト / いいね / 表示回数)を落とす。
+
+    X の投稿は本文のあとにこれらの数字が並び、そのまま読み上げると
+    「12、133、663、3.5万」と数字の羅列になる。本文の行は必ず文字を含み、かつ
+    件数表示の形にはならないので、末尾から _is_ui_noise が続く間だけ削れば本文は
+    削られない。全部消えてしまう場合(数字だけの表など)は元のまま返す。
+    """
+    if not text:
+        return text
+    lines = text.split("\n")
+    i = len(lines)
+    while i > 0 and _is_ui_noise(lines[i - 1]):
+        i -= 1
+    if i == len(lines):
+        return text
+    trimmed = "\n".join(lines[:i]).rstrip()
+    return trimmed if trimmed.strip() else text
 
 
 def _find_anchor(full_text, anchor):
