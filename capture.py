@@ -70,6 +70,7 @@ DESCEND_BUDGET = 400  # クリック対象を矩形で降りて探すときに�
 # いずれも取り直すと解決するので、静かに劣化した経路へ落ちる前にやり直す。
 CLICK_TARGET_RETRY = 3  # クリック対象が葉に届くまでの取り直し回数
 RANGE_RETRY = 2         # RangeFromChild の取り直し回数
+CLICK_TARGET_RETRY_DELAY = 0.04  # 遅延構築中のツリーが安定するのを待つ秒数
 # 項目ロールが無いページ向けの緩い境界。ヘッダ / ナビ / フッターを除ける。
 SECTION_ROLES = ("main",)
 
@@ -90,17 +91,39 @@ class TextCapturer(threading.Thread):
         self._on_error = on_error
         self._max_chars = max_chars
         self._debug = debug
+        # 取得は UI Automation の都合で直列実行するが、要求には世代番号を付ける。
+        # これにより取得中の再クリックや停止後に、古い結果が遅れて読み上げられる
+        # 競合を防ぐ。callback もこの lock 内で呼び、cancel() 後に古い speak が
+        # キューへ入る隙間を作らない。
+        self._state_lock = threading.Lock()
+        self._generation = 0
 
     def request(self, x, y):
-        self._q.put((x, y))
+        with self._state_lock:
+            self._generation += 1
+            generation = self._generation
+        self._q.put((generation, x, y))
+
+    def cancel(self):
+        """処理待ち・処理中の取得結果を無効化する。"""
+        with self._state_lock:
+            self._generation += 1
+            try:
+                while True:
+                    self._q.get_nowait()
+            except queue.Empty:
+                pass
 
     def run(self):
         with auto.UIAutomationInitializerInThread():
             while True:
-                x, y = self._q.get()
+                generation, x, y = self._q.get()
                 # 連打された場合は最後のクリックだけ処理する
-                while not self._q.empty():
-                    x, y = self._q.get()
+                try:
+                    while True:
+                        generation, x, y = self._q.get_nowait()
+                except queue.Empty:
+                    pass
                 lines = []
                 started = time.perf_counter()
                 try:
@@ -111,13 +134,22 @@ class TextCapturer(threading.Thread):
                 text = _trim_trailing_ui(text)
                 elapsed = time.perf_counter() - started
                 lines.insert(0, f"取得所要時間={elapsed * 1000:.0f}ms")
+                with self._state_lock:
+                    if generation != self._generation:
+                        lines.append("=> 新しい要求または停止により結果を破棄")
+                    else:
+                        # 画像やアイコンをクリックすると ￼ や数字だけが返る。
+                        # 読み上げても無音になるため取得失敗として知らせる。
+                        try:
+                            if text and _has_letter(text):
+                                self._on_text(text)
+                            else:
+                                self._on_error()
+                        except Exception as e:
+                            # 通知音など周辺処理の一時的な失敗で、以後すべての
+                            # キャプチャを担う常駐スレッドまで終了させない。
+                            lines.append(f"CALLBACK EXCEPTION: {type(e).__name__}: {e}")
                 self._write_debug(x, y, text, lines)
-                # 画像やアイコンをクリックすると ￼ や数字だけが返る。読み上げても
-                # 無音になるだけなので、取得失敗として橙の点灯で知らせる。
-                if text and _has_letter(text):
-                    self._on_text(text)
-                else:
-                    self._on_error()
 
     # ---- テキスト取得本体 ----
 
@@ -181,12 +213,24 @@ class TextCapturer(threading.Thread):
         # そのまま進むと文書全体を種にしてしまい、ページ先頭の隠しナビゲーション
         # (「キーボードショートカットを表示」等)を読み上げてしまう。取り直せば
         # 解決するので、葉に届くまで数回やり直す。
+        control = None
+        descended = 0
+        leaf = False
         for attempt in range(CLICK_TARGET_RETRY):
-            control, descended, leaf = self._resolve_click_target(
-                auto.ControlFromPoint(x, y), x, y, log)
+            try:
+                hit = auto.ControlFromPoint(x, y)
+                control, descended, leaf = self._resolve_click_target(
+                    hit, x, y, log)
+            except Exception as e:
+                log.append(f"=> クリック対象取得失敗(試行{attempt + 1}): "
+                           f"{type(e).__name__}")
             if leaf:
                 break
             log.append(f"=> クリック対象が葉に届かず(試行{attempt + 1}) → 取り直す")
+            if attempt + 1 < CLICK_TARGET_RETRY:
+                time.sleep(CLICK_TARGET_RETRY_DELAY)
+
+        control_anchor = self._node_text(control)
 
         # クリック位置から親へ辿り、TextPattern を持つ祖先をすべて集める。
         # あわせて祖先ノード自体も記録し、集約フォールバックの起点に使う。
@@ -251,6 +295,14 @@ class TextCapturer(threading.Thread):
             near_pat = providers[0][1]  # クリック位置に最も近い要素で位置を特定
         log.append(f"=> providers={len(providers)} bigDocLen={len(big_text)}")
 
+        # 葉にも TextPattern にも到達せず、名前や ARIA 境界さえ無い場合は、
+        # ツリー構築中の粗い Pane/Document を拾った状態。ここから子孫を集約すると
+        # タスクバー等の無関係な UI を本文として返すため、誤読より取得失敗を選ぶ。
+        if (not leaf and not providers and boundary is None
+                and not _is_strong_anchor(control_anchor)):
+            log.append("=> クリック対象の根拠が無いため取得失敗とする")
+            return None
+
         # 「クリックした要素」が文書全体そのもの = クリック位置の手がかりが何も
         # 無い状態。この状態でだけ、位置を特定できなければ取得失敗として扱う。
         # (葉に届かなかっただけなら、余白のクリック等で従来どおり読める方がよい)
@@ -265,7 +317,8 @@ class TextCapturer(threading.Thread):
         anchor = ""
         if len(big_text) < AGG_TRIGGER:
             # 集約の打ち切り判定に使うため、アンカー(クリック行)を先に取っておく
-            anchor = self._anchor_line(near_pat, x, y, log) if near_pat else ""
+            anchor = (control_anchor if _is_strong_anchor(control_anchor) else
+                      self._anchor_line(near_pat, x, y, log) if near_pat else "")
             # 境界が分かっているならそこで祖先辿りを止める(隣の項目を巻き込まない)
             scope = ancestors if boundary is None else ancestors[:boundary[1] + 1]
             agg_text = self._aggregate_ancestors(scope, anchor, log)
@@ -288,7 +341,7 @@ class TextCapturer(threading.Thread):
         if big_pat is not None and not use_aggregate:
             tail = self._read_to_boundary(
                 big_pat, control, boundary[0] if boundary else None, x, y,
-                coarse=coarse, log=log)
+                coarse=coarse, expected_anchor=control_anchor, log=log)
             if tail and tail.strip():
                 log.append(f"=> クリック位置→境界末尾 成功 長={len(tail)}")
                 return tail
@@ -301,6 +354,8 @@ class TextCapturer(threading.Thread):
 
         # アンカー方式: クリックした行を目印に、再構成した本文中の開始位置を求める
         # (TextPattern を持たない Electron 系アプリ向け)
+        if not anchor and _is_strong_anchor(control_anchor):
+            anchor = control_anchor
         if not anchor and near_pat is not None:
             anchor = self._anchor_line(near_pat, x, y, log)
         if not anchor and big_pat is not None:
@@ -315,6 +370,9 @@ class TextCapturer(threading.Thread):
                 log.append(f"=> anchor 一致 idx={idx} 読み上げ長={len(full_text) - idx}")
                 return full_text[idx:]
             log.append("=> anchor 本文中に見つからず")
+            if anchor == control_anchor and _is_strong_anchor(control_anchor):
+                log.append("=> クリック位置を裏付けられないため取得失敗とする")
+                return None
 
         # フォールバック: 再構成した本文全体を読む
         log.append(f"=> フォールバック 全文読み上げ 長={len(full_text)}")
@@ -689,7 +747,7 @@ class TextCapturer(threading.Thread):
         return None
 
     def _read_to_boundary(self, pattern, control, boundary, x, y,
-                          coarse=False, log=None):
+                          coarse=False, expected_anchor="", log=None):
         """クリック位置(行頭にそろえる)から、クリックした項目の末尾までを返す。
 
         開始位置: RangeFromPoint(座標→文字位置)は、X のタイムラインのように
@@ -737,13 +795,26 @@ class TextCapturer(threading.Thread):
                 log.append("=> クリック位置を特定できず(粗いノード+矩形不一致)→ 取得失敗")
             return ""
 
+        def accept(text):
+            # 矩形が一致していれば開始位置は画面座標で検証済み。矩形が取れず
+            # 文書順だけで確定した場合は、クリック要素の Name が読み始め付近に
+            # あることを追加確認する。動的な Chromium 文書で RangeFromPoint が
+            # 一時的に別の通知文を指した結果を、そのまま読ませないため。
+            if matched or not _is_strong_anchor(expected_anchor):
+                return True
+            if _anchor_near_start(text, expected_anchor):
+                return True
+            if log is not None:
+                log.append("  開始検証: クリック要素と取得範囲が一致せず → 破棄")
+            return False
+
         end_range = self._range_from_child(pattern, boundary)
         if end_range is not None:
             try:
                 clipped = r.Clone()
                 if clipped.MoveEndpointByRange(End, end_range, End, waitTime=0):
                     text = clipped.GetText(self._max_chars) or ""
-                    if text.strip():
+                    if text.strip() and accept(text):
                         if log is not None:
                             log.append(f"  終端: 項目境界まで 長={len(text)}")
                         return text
@@ -754,7 +825,8 @@ class TextCapturer(threading.Thread):
         try:
             if not r.MoveEndpointByRange(End, pattern.DocumentRange, End, waitTime=0):
                 return ""
-            return r.GetText(self._max_chars) or ""
+            text = r.GetText(self._max_chars) or ""
+            return text if accept(text) else ""
         except Exception:
             return ""
 
@@ -878,3 +950,25 @@ def _find_anchor(full_text, anchor):
     if j >= 0:
         return mapping[j]
     return -1
+
+
+def _is_strong_anchor(text):
+    """クリック位置の根拠に使える程度の表示テキストか。"""
+    return bool(text and len("".join(text.split())) >= 4 and _has_letter(text))
+
+
+def _anchor_near_start(text, anchor, limit=ANCHOR_MAX):
+    """取得範囲の先頭付近がクリック要素のテキストと対応するか。"""
+    if not text or not anchor:
+        return False
+    idx = _find_anchor(text, anchor)
+    if 0 <= idx <= limit:
+        return True
+
+    # クリック要素が長い段落で、取得範囲がその途中から始まる場合も許容する。
+    # 空白差を吸収した取得範囲の先頭が anchor 内にあれば、同じ段落とみなせる。
+    compact_text = "".join(text.split())
+    compact_anchor = "".join(anchor.split())
+    overlap = min(12, len(compact_text), len(compact_anchor))
+    head = compact_text[:overlap]
+    return overlap >= 4 and head in compact_anchor

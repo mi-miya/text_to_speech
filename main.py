@@ -63,6 +63,23 @@ def normalize(text):
     return text.strip()
 
 
+def resolve_voice(configured, voices):
+    """保存済み音声を解決し、消えていれば安全なローカル音声へ退避する。"""
+    if not configured:
+        return None
+    configured_lower = configured.lower()
+    for name in voices:
+        if name.lower() == configured_lower:
+            return name
+    for name in voices:
+        if configured_lower in name.lower() or name.lower() in configured_lower:
+            return name
+    # Natural Voice Adapter や音声モデルが一時的に消えた場合、オンライン音声を
+    # 勝手に選ぶと本文が外部へ送信され得る。まず Desktop/非 Online を選ぶ。
+    return next((name for name in voices if "online" not in name.lower()),
+                voices[0] if voices else None)
+
+
 class FloatingWidget:
     """常に最前面に表示される丸いアイコン。ドラッグ移動・右クリックメニュー付き。"""
 
@@ -119,12 +136,12 @@ class FloatingWidget:
 
     def _build_menu(self):
         self.menu = tk.Menu(self.root, tearoff=0)
-        self.menu.add_command(label="読み上げを停止 (Esc)", command=self.app.speech.stop)
+        self.menu.add_command(label="読み上げを停止 (Esc)", command=self.app.stop)
         self.menu.add_separator()
 
         self.menu.add_command(label="話速を調整...", command=self._open_rate_dialog)
 
-        self._voice_var = tk.StringVar(value=self.app.config.voice or "")
+        self._voice_var = tk.StringVar(value=self.app.active_voice or "")
         voice_menu = tk.Menu(self.menu, tearoff=0)
         if self.app.voices:
             for name in self.app.voices:
@@ -233,19 +250,21 @@ class FloatingWidget:
         if self._has_moved:
             self.app.config.pos = (self.root.winfo_x(), self.root.winfo_y())
         else:
-            self.app.speech.stop()  # ドラッグでない左クリックは停止
+            self.app.stop()  # ドラッグでない左クリックは停止
 
     # ---- 状態表示 ----
 
     def _poll_state(self):
-        if not self._flashing:
+        # capture スレッドは Event を立てるだけにし、Tk の操作は必ず
+        # mainloop のスレッドで行う。Tkinter のスレッド間呼び出しによる
+        # RuntimeError やまれな停止を防ぐ。
+        if self.app.capture_error_pending.is_set():
+            self.app.capture_error_pending.clear()
+            self._do_flash()
+        elif not self._flashing:
             color = COLOR_SPEAKING if self.app.speech.is_speaking else COLOR_IDLE
             self.canvas.itemconfig(self.circle, fill=color)
         self.root.after(300, self._poll_state)
-
-    def flash_error(self):
-        """テキスト取得失敗を橙色の点灯で知らせる(他スレッドから呼び出し可)。"""
-        self.root.after(0, self._do_flash)
 
     def _do_flash(self):
         self._flashing = True
@@ -263,6 +282,7 @@ class App:
     def __init__(self):
         self.config = Config()
         self.speech = SpeechEngine(rate=self.config.rate, voice_name=self.config.voice)
+        self.capture_error_pending = threading.Event()
         self.capturer = TextCapturer(
             on_text=self._on_text,
             on_error=self._on_capture_error,
@@ -276,6 +296,12 @@ class App:
             voices = []
         # 日本語音声のみメニューに出す (オンライン英語音声の羅列を防ぐ)
         self.voices = [n for n in voices if "Japanese" in n] or voices
+        self.active_voice = resolve_voice(self.config.voice, self.voices)
+        if (self.config.voice and self.active_voice
+                and self.active_voice.lower() != self.config.voice.lower()):
+            # 設定は書き換えず、音声モデルが復旧した次回起動時に元の選択へ戻せる
+            # ようにする。現在の実行だけ、確実に存在する音声へフォールバックする。
+            self.speech.set_voice(self.active_voice)
         self.widget = None
 
     # ---- テキスト取得 → 読み上げ ----
@@ -285,8 +311,7 @@ class App:
 
     def _on_capture_error(self):
         winsound.MessageBeep(winsound.MB_ICONASTERISK)
-        if self.widget:
-            self.widget.flash_error()
+        self.capture_error_pending.set()
 
     # ---- フック ----
 
@@ -302,7 +327,12 @@ class App:
 
     def _on_key_press(self, key):
         if key == keyboard.Key.esc:
-            self.speech.stop()
+            self.stop()
+
+    def stop(self):
+        """読み上げと、まだ完了していないテキスト取得をまとめて停止する。"""
+        self.capturer.cancel()
+        self.speech.stop()
 
     # ---- 設定変更 ----
 
@@ -312,12 +342,13 @@ class App:
 
     def set_voice(self, name):
         self.config.voice = name
+        self.active_voice = name
         self.speech.set_voice(name)
 
     # ---- 起動・終了 ----
 
     def quit(self):
-        self.speech.stop()
+        self.stop()
         try:
             self.mouse_listener.stop()
             self.keyboard_listener.stop()

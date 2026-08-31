@@ -73,9 +73,12 @@ def sanitize_for_sapi(text):
 def list_voices():
     """インストール済み SAPI 音声の説明文字列一覧を返す(メインスレッド用)。"""
     pythoncom.CoInitialize()
-    voice = win32com.client.Dispatch("SAPI.SpVoice")
-    return [voice.GetVoices().Item(i).GetDescription()
-            for i in range(voice.GetVoices().Count)]
+    try:
+        voice = win32com.client.Dispatch("SAPI.SpVoice")
+        tokens = voice.GetVoices()
+        return [tokens.Item(i).GetDescription() for i in range(tokens.Count)]
+    finally:
+        pythoncom.CoUninitialize()
 
 
 SRSE_DONE = 1  # SpeechRunState: 再生完了
