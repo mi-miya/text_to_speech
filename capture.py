@@ -89,12 +89,16 @@ CLICK_TARGET_RETRY_DELAY = 0.04  # 遅延構築中のツリーが安定するの
 SECTION_ROLES = ("main",)
 
 DEBUG_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "capture_debug.log")
-DEBUG_KEEP = 8        # ログに残す直近の取得回数。1 回分だけだと「さっきの失敗」を
-                      # 追えないため履歴にする(区切りは DEBUG_SEP)。
+DEBUG_KEEP = 40       # ログに残す直近の取得回数。1 回分だけだと「さっきの失敗」を
+                      # 追えないため履歴にする(区切りは DEBUG_SEP)。たまにしか
+                      # 起きない不具合は、気づいてから数回試すうちに流れてしまうので
+                      # 多めに残す。
 DEBUG_SEP = "=" * 60
 
 LABEL_MAX = 8            # ラベル行とみなす最大文字数(空白を除く)
 REACTION_MIN_COUNTS = 2  # 反応ラベルの塊とみなすのに必要な「件数だけの行」の数
+
+TREE_SCOPE_DESCENDANTS = 4  # UIA の TreeScope_Descendants (uiautomation は定数を公開していない)
 
 Start = auto.TextPatternRangeEndpoint.Start
 End = auto.TextPatternRangeEndpoint.End
@@ -229,6 +233,45 @@ class TextCapturer(threading.Thread):
                        f"{getattr(node, 'ControlTypeName', '?')}")
         return node, depth, leaf
 
+    def _search_by_rect(self, root, x, y, log=None):
+        """root 配下の全要素から、クリック座標を含む最小の要素を探して返す。
+
+        Chromium は座標→要素の問い合わせに、過去の結果のキャッシュと矩形での
+        近似で即答する。そのため本文の上をクリックしても文書全体が返ることがあり、
+        取り直しても直らないことがある(X で同じ投稿が 4 回続けて失敗した)。
+        _resolve_click_target で降り直そうにも、X は文書直下の入れ物がどれも
+        クリック位置を矩形に含まない(子が親の矩形からはみ出している)ので、
+        1 段も降りられない。親の矩形を当てにせず、全要素の矩形を直接調べる。
+
+        要素ごとに矩形を尋ねると数千回の COM 呼び出しになるので、キャッシュ要求で
+        矩形ごと一括取得する。見つからなければ None。
+        """
+        started = time.perf_counter()
+        try:
+            client = auto.uiautomation._AutomationClient.instance().IUIAutomation
+            request = client.CreateCacheRequest()
+            request.AddProperty(auto.PropertyId.BoundingRectangleProperty)
+            found = root.Element.FindAllBuildCache(
+                TREE_SCOPE_DESCENDANTS, client.CreateTrueCondition(), request)
+            count = found.Length
+            rects = []
+            for i in range(count):
+                r = found.GetElement(i).CachedBoundingRectangle
+                rects.append((r.left, r.top, r.right, r.bottom))
+            best = _smallest_containing(rects, x, y)
+            node = (auto.Control.CreateControlFromElement(found.GetElement(best))
+                    if best is not None else None)
+        except Exception as e:
+            if log is not None:
+                log.append(f"=> 矩形検索失敗: {type(e).__name__}")
+            return None
+        if log is not None:
+            elapsed = (time.perf_counter() - started) * 1000
+            log.append(f"=> 矩形検索: {count} 要素 {elapsed:.0f}ms → "
+                       + (getattr(node, 'ControlTypeName', '?') if node is not None
+                          else "該当なし"))
+        return node
+
     def _extract(self, x, y, log):
         # Chromium はアクセシビリティツリーを遅延構築するため、ControlFromPoint が
         # 葉ではなく DocumentControl を返すことがある(実測で 40 回に 1 回程度)。
@@ -243,6 +286,13 @@ class TextCapturer(threading.Thread):
                 hit = auto.ControlFromPoint(x, y)
                 control, descended, leaf = self._resolve_click_target(
                     hit, x, y, log)
+                # 全要素の検索は重い(実測で 600 要素あたり 70ms)ので 1 回だけ。
+                # 余白のクリックなら何度探しても同じ結果になる。
+                if not leaf and attempt == 0 and _is_document(control):
+                    found = self._search_by_rect(control, x, y, log)
+                    if found is not None:
+                        control, _, leaf = self._resolve_click_target(
+                            found, x, y, log)
             except Exception as e:
                 log.append(f"=> クリック対象取得失敗(試行{attempt + 1}): "
                            f"{type(e).__name__}")
@@ -1114,6 +1164,30 @@ class TextCapturer(threading.Thread):
         except (OSError, ValueError):
             # 診断ログの失敗で常駐スレッド(以後すべての取得)を止めない
             pass
+
+
+def _is_document(node):
+    try:
+        return node.ControlTypeName == "DocumentControl"
+    except Exception:
+        return False
+
+
+def _smallest_containing(rects, x, y):
+    """(left, top, right, bottom) の並びから、座標を含む最小の矩形の添字を返す。
+
+    座標を含む中で最も小さいものが、視覚的に最前面の要素。同じ大きさなら
+    文書順で後ろ(=より深い子)を採る。該当が無ければ None。
+    """
+    best = None
+    best_area = None
+    for i, (left, top, right, bottom) in enumerate(rects):
+        if not (left <= x < right and top <= y < bottom):
+            continue
+        area = (right - left) * (bottom - top)
+        if best_area is None or area <= best_area:
+            best, best_area = i, area
+    return best
 
 
 def _rects(text_range):

@@ -13,6 +13,7 @@ from capture import (
     _find_anchor,
     _has_content,
     _is_strong_anchor,
+    _smallest_containing,
     _trim_to_anchor,
     _trim_trailing_ui,
 )
@@ -356,6 +357,24 @@ class LineSeekIntoUnmeasurableRegionTests(unittest.TestCase):
         rng, verified = self.capturer._start_range_at_point(None, 20, 70, seed=seed)
         self.assertTrue(verified)
         self.assertEqual(self.TEXT[32:40], rng.GetText())
+
+
+class SmallestContainingTests(unittest.TestCase):
+    def test_the_smallest_rect_containing_the_point_wins(self):
+        rects = [(0, 0, 1000, 1000), (100, 100, 300, 130), (0, 0, 0, 0)]
+        self.assertEqual(1, _smallest_containing(rects, 150, 110))
+
+    def test_parents_that_do_not_enclose_the_point_are_irrelevant(self):
+        # X は文書直下の入れ物がクリック位置を矩形に含まない(高さ 0 など)
+        rects = [(0, 0, 1000, 0), (100, 100, 300, 130)]
+        self.assertEqual(1, _smallest_containing(rects, 150, 110))
+
+    def test_the_deeper_one_wins_among_equal_sizes(self):
+        rects = [(100, 100, 300, 130), (100, 100, 300, 130)]
+        self.assertEqual(1, _smallest_containing(rects, 150, 110))
+
+    def test_none_when_nothing_contains_the_point(self):
+        self.assertIsNone(_smallest_containing([(0, 0, 10, 10)], 150, 110))
 
 
 class CountOnlyTests(unittest.TestCase):
