@@ -14,6 +14,7 @@ from capture import (
     _has_content,
     _is_strong_anchor,
     _smallest_containing,
+    _tiling_slots,
     _trim_to_anchor,
     _trim_trailing_ui,
 )
@@ -375,6 +376,45 @@ class SmallestContainingTests(unittest.TestCase):
 
     def test_none_when_nothing_contains_the_point(self):
         self.assertIsNone(_smallest_containing([(0, 0, 10, 10)], 150, 110))
+
+
+class TilingSlotsTests(unittest.TestCase):
+    """X の実測値: 1 件だけ 463px 古い位置を報告していた投稿を見抜けるか。"""
+
+    RECTS = [
+        (0, -1269, 600, -1147),
+        (0, -1147, 600, -1004),
+        (0, -1004, 600, -861),
+        (0, -861, 600, -156),
+        (0, -619, 600, -476),    # 本来は -156..-13。463px 古い
+        (0, -13, 600, 130),
+        (0, 130, 600, 252),
+    ]
+
+    def test_the_stale_item_gets_its_real_slot_and_its_shift(self):
+        slots = _tiling_slots(self.RECTS)
+        self.assertEqual((-156, -13, -463), slots[4])
+
+    def test_items_reported_correctly_have_no_shift(self):
+        slots = _tiling_slots(self.RECTS)
+        self.assertEqual([0] * 6, [slots[i][2] for i in (0, 1, 2, 3, 5, 6)])
+        self.assertEqual((-13, 130, 0), slots[5])
+
+    def test_zero_height_items_are_ignored(self):
+        rects = self.RECTS[:3] + [(0, 0, 0, 0)] + self.RECTS[3:]
+        self.assertEqual((-156, -13, -463), _tiling_slots(rects)[5])
+
+    def test_a_horizontal_row_is_not_a_list(self):
+        rects = [(i * 100, 50, i * 100 + 100, 80) for i in range(6)]
+        self.assertIsNone(_tiling_slots(rects))
+
+    def test_items_with_gaps_between_them_are_not_a_list(self):
+        rects = [(0, i * 150 + i * i * 7, 600, i * 150 + i * i * 7 + 100)
+                 for i in range(6)]
+        self.assertIsNone(_tiling_slots(rects))
+
+    def test_too_few_items_are_not_judged(self):
+        self.assertIsNone(_tiling_slots(self.RECTS[:3]))
 
 
 class CountOnlyTests(unittest.TestCase):

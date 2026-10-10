@@ -98,7 +98,14 @@ DEBUG_SEP = "=" * 60
 LABEL_MAX = 8            # ラベル行とみなす最大文字数(空白を除く)
 REACTION_MIN_COUNTS = 2  # 反応ラベルの塊とみなすのに必要な「件数だけの行」の数
 
-TREE_SCOPE_DESCENDANTS = 4  # UIA の TreeScope_Descendants (uiautomation は定数を公開していない)
+# 縦に並ぶリスト(X のタイムライン等)で、古い矩形を報告している項目を見抜く条件。
+TILE_MIN_ITEMS = 5     # これ未満の兄弟では並びを判断しない(投稿の内側の小さな
+                       # 縦積みを、項目のリストと取り違えないため)
+TILE_TOLERANCE = 3     # 並びどおりとみなす誤差 (px)
+TILE_MAJORITY = 0.6    # 兄弟のうちこの割合が並びどおりなら、縦のリストとみなす
+TILE_WALK_UP = 16      # リストを探して親を辿る最大段数
+
+TREE_SCOPE_DESCENDANTS = 4 # UIA の TreeScope_Descendants (uiautomation は定数を公開していない)
 
 Start = auto.TextPatternRangeEndpoint.Start
 End = auto.TextPatternRangeEndpoint.End
@@ -272,6 +279,88 @@ class TextCapturer(threading.Thread):
                           else "該当なし"))
         return node
 
+    def _retarget_stale(self, control, x, y, log=None):
+        """Chromium が古い位置を報告している項目を見抜き、クリック対象を選び直す。
+
+        X のタイムラインでは、上の投稿の高さが後から変わる(動画や画像の読み込み)
+        と下の投稿が押し下げられるが、Chromium が一部の投稿の矩形を更新し損ねる
+        ことがある(実測で 1 件だけ 463px 古いまま)。古い矩形をクリック座標と
+        突き合わせると、当たらずに取得失敗になるか、隣の投稿や隣の行に当たる。
+
+        リストの項目は縦に隙間なく並ぶので、兄弟の高さを積み上げれば各項目の
+        本来の位置が分かる(_tiling_slots)。クリック座標を本来の位置で受けた項目を
+        対象にし、その項目の矩形がずれているぶん y を補正して返す。項目の中身は
+        丸ごと同じだけずれているので、補正した y なら行や文字の矩形とも合う。
+
+        戻り値は (対象ノード, 葉に到達したか, 補正後の y)。補正が要らなければ None。
+        """
+        try:
+            if control is None or control.FrameworkId != "Chrome":
+                return None
+        except Exception:
+            return None
+        node = control
+        below = None   # node の子のうち、クリック対象へ続く側の RuntimeId
+        for _ in range(TILE_WALK_UP):
+            if node is None or _is_document(node):
+                return None
+            try:
+                children = node.GetChildren()
+            except Exception:
+                return None
+            fixed = self._retarget_in_list(children, below, x, y, log)
+            if fixed is not None:
+                return fixed
+            # この段は並びどおり(またはリストではない)。項目ごと古い位置に
+            # ある場合、項目の内側はつじつまが合って見えるので、外側も調べる。
+            try:
+                below = node.GetRuntimeId()
+                node = node.GetParentControl()
+            except Exception:
+                return None
+        return None
+
+    def _retarget_in_list(self, children, below, x, y, log=None):
+        """children が縦のリストで、クリックを受けるべき項目の矩形が古ければ選び直す。"""
+        if len(children) < TILE_MIN_ITEMS:
+            return None
+        rects = []
+        for child in children:
+            try:
+                r = child.BoundingRectangle
+                rects.append((r.left, r.top, r.right, r.bottom))
+            except Exception:
+                rects.append((0, 0, 0, 0))
+        slots = _tiling_slots(rects)
+        if slots is None:
+            return None
+        target = next((i for i, (top, bottom, _) in slots.items()
+                       if top <= y < bottom), None)
+        if target is None:
+            return None
+        shift = slots[target][2]
+        on_path = None
+        if below is not None:
+            for i, child in enumerate(children):
+                try:
+                    if child.GetRuntimeId() == below:
+                        on_path = i
+                        break
+                except Exception:
+                    pass
+        if abs(shift) <= TILE_TOLERANCE and (below is None or on_path == target):
+            return None   # 並びどおり。矩形は信用できる
+        shifted_y = y + shift
+        found, depth, leaf = self._resolve_click_target(children[target], x, shifted_y)
+        if not leaf and not depth:
+            deeper = self._search_by_rect(children[target], x, shifted_y, log)
+            if deeper is not None:
+                found, _, leaf = self._resolve_click_target(deeper, x, shifted_y)
+        if log is not None:
+            log.append(f"=> 古い矩形を補正: 項目[{target}] が {shift:+d}px ずれ → "
+                       f"y={y}→{shifted_y} {getattr(found, 'ControlTypeName', '?')}")
+        return found, leaf, shifted_y
+
     def _extract(self, x, y, log):
         # Chromium はアクセシビリティツリーを遅延構築するため、ControlFromPoint が
         # 葉ではなく DocumentControl を返すことがある(実測で 40 回に 1 回程度)。
@@ -281,26 +370,34 @@ class TextCapturer(threading.Thread):
         control = None
         descended = 0
         leaf = False
+        settled = False   # 全要素の矩形検索でクリック対象を確定できたか
         for attempt in range(CLICK_TARGET_RETRY):
             try:
                 hit = auto.ControlFromPoint(x, y)
                 control, descended, leaf = self._resolve_click_target(
                     hit, x, y, log)
-                # 全要素の検索は重い(実測で 600 要素あたり 70ms)ので 1 回だけ。
-                # 余白のクリックなら何度探しても同じ結果になる。
-                if not leaf and attempt == 0 and _is_document(control):
+                if not leaf and _is_document(control):
                     found = self._search_by_rect(control, x, y, log)
                     if found is not None:
                         control, _, leaf = self._resolve_click_target(
                             found, x, y, log)
+                        # 全要素を調べた結果なので、葉でなくても(画像の脇や行間の
+                        # クリック)これ以上は絞れない。ここで取り直すと Chromium が
+                        # また文書全体を返し、見つけた要素を上書きして失ってしまう。
+                        settled = True
             except Exception as e:
                 log.append(f"=> クリック対象取得失敗(試行{attempt + 1}): "
                            f"{type(e).__name__}")
-            if leaf:
+            if leaf or settled:
                 break
             log.append(f"=> クリック対象が葉に届かず(試行{attempt + 1}) → 取り直す")
             if attempt + 1 < CLICK_TARGET_RETRY:
                 time.sleep(CLICK_TARGET_RETRY_DELAY)
+
+        fixed = self._retarget_stale(control, x, y, log)
+        if fixed is not None:
+            # 以降の矩形照合(行・文字の特定)も、同じ古い座標系の上で行う
+            control, leaf, y = fixed
 
         control_anchor = self._node_text(control)
 
@@ -1171,6 +1268,34 @@ def _is_document(node):
         return node.ControlTypeName == "DocumentControl"
     except Exception:
         return False
+
+
+def _tiling_slots(rects):
+    """縦に隙間なく並ぶ兄弟の矩形から、各要素の本来の位置とずれを求める。
+
+    戻り値は {添字: (本来の top, 本来の bottom, 報告された top - 本来の top)}。
+    高さを積み上げた位置と報告された top の差は、正しく報告されている要素どうし
+    なら同じ値になる。その多数派を基準にするので、古い矩形の要素が混じっていても
+    残りから本来の位置を復元できる。多数派が TILE_MAJORITY に満たなければ、
+    縦に並ぶリストではない(横並び・重なり・隙間あり)とみなして None を返す。
+    """
+    items = [(i, r[1], r[3]) for i, r in enumerate(rects) if r[3] > r[1]]
+    if len(items) < TILE_MIN_ITEMS:
+        return None
+    stacked = []   # (添字, 積み上げた位置, 高さ, 報告された top との差)
+    total = 0
+    for i, top, bottom in items:
+        stacked.append((i, total, bottom - top, top - total))
+        total += bottom - top
+    base, votes = None, 0
+    for _, _, _, offset in stacked:
+        agree = sum(1 for s in stacked if abs(s[3] - offset) <= TILE_TOLERANCE)
+        if agree > votes:
+            base, votes = offset, agree
+    if votes < TILE_MIN_ITEMS or votes < len(stacked) * TILE_MAJORITY:
+        return None
+    return {i: (pos + base, pos + base + height, offset - base)
+            for i, pos, height, offset in stacked}
 
 
 def _smallest_containing(rects, x, y):
