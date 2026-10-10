@@ -8,18 +8,22 @@ SAPI 音声として見えるようになり、このコードのまま使える
 import queue
 import re
 import threading
+import unicodedata
 
 import pythoncom
 import win32com.client
 
 SVSF_ASYNC = 1
 SVSF_PURGE = 2
+# 本文を SAPI XML として解釈させない。ページ上の <tag> がマークアップ扱いで欠落したり、
+# <speak> 等で合成が失敗して無音になる(Nanami で確認)のを防ぐ。
+SVSF_IS_NOT_XML = 16
 
 # 自然音声(ニューラル合成)は Speak に渡した塊をある程度まとめて合成してから
 # 再生を始める。クリック位置から文末までの全文を一度に渡すと、最初の音が出るまで
 # 全体の合成を待たされる。そこで「最初の一文」だけ先に鳴らし、残りは後ろにキュー
 # することで、立ち上がりを「1 文分の合成時間」まで短縮する。
-_SENTENCE_END = re.compile(r"(?<=[。!?！?\n])")
+_SENTENCE_END = re.compile(r"(?<=[。!?！？\n])")
 FIRST_CHUNK_MIN = 60  # 最初に鳴らす塊のおおよその下限文字数(短すぎる細切れを防ぐ)
 
 
@@ -70,14 +74,57 @@ def sanitize_for_sapi(text):
     return _INVALID_XML.sub(" ", text)
 
 
+# URL は読み上げると長いだけで内容が伝わらないので読み飛ばす。日本語の文章は
+# URL の直後に空白なしで本文が続くことが多いため、URL に使える ASCII 文字だけを
+# 対象にして後続の本文を巻き込まない。X はスキームを省いて「example.com/abc…」と
+# 表示するので、スキーム無しでも「ドメイン + /パス」の形なら URL とみなす
+# (「3.5」「Node.js」のようにパスの無いものは本文なので残す)。
+_URL_CHARS = r"[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]"
+_URL = re.compile(
+    r"(?:https?://|www\.)" + _URL_CHARS + r"+…?"
+    r"|(?<![A-Za-z0-9@._-])[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/"
+    + _URL_CHARS + r"*…?"
+)
+
+# 絵文字の合成に使う不可視の部品(異体字セレクタ / 囲み記号 / タグ文字)。
+_EMOJI_PARTS = re.compile("[︀-️⃣󠀠-󠁿]")
+# 読み上げても意味を成さない装飾記号。通貨・%・四則演算・句読点は文意や
+# 抑揚に関わるので残し、見出しや飾りに使われるものだけを落とす。
+_DECOR_CHARS = frozenset("#＃*＊_＿|｜~^`\※")
+_RULE_LINE = re.compile(r"[-=‐-―─━]{3,}")  # ----- や ━━━ のような罫線
+
+
+def _is_unspoken(ch):
+    """絵文字・装飾記号など、読み飛ばす文字か。"""
+    if ch in _DECOR_CHARS:
+        return True
+    # So: 絵文字・★・♪・©・罫線素片 / Sk: 肌色修飾など / Co: 私用領域(アイコンフォント)
+    if unicodedata.category(ch) in ("So", "Sk", "Co"):
+        return True
+    return "←" <= ch <= "⇿"  # 矢印(→ ⇒ 等)
+
+
+def strip_unspoken(text):
+    """絵文字・装飾記号・URL を読み飛ばす(利用者の要望)。"""
+    text = _URL.sub(" ", text)
+    text = _EMOJI_PARTS.sub("", text)
+    text = _RULE_LINE.sub(" ", text)
+    text = "".join(" " if _is_unspoken(ch) else ch for ch in text)
+    return re.sub(r"[ 	]{2,}", " ", text)
+
+
 def list_voices():
     """インストール済み SAPI 音声の説明文字列一覧を返す(メインスレッド用)。"""
     pythoncom.CoInitialize()
+    voice = tokens = None
     try:
         voice = win32com.client.Dispatch("SAPI.SpVoice")
         tokens = voice.GetVoices()
         return [tokens.Item(i).GetDescription() for i in range(tokens.Count)]
     finally:
+        # COM オブジェクトを CoUninitialize より先に解放する。後だと
+        # "Win32 exception occurred releasing IUnknown" が stderr に出る。
+        del voice, tokens
         pythoncom.CoUninitialize()
 
 
@@ -99,7 +146,7 @@ class SpeechEngine:
         return self._speaking
 
     def speak(self, text):
-        text = sanitize_for_sapi(text)
+        text = strip_unspoken(sanitize_for_sapi(text))
         if text.strip():
             self._q.put(("speak", text))
 
@@ -132,9 +179,9 @@ class SpeechEngine:
                     # 最初の一文だけ即座に再生(PURGE で前の読み上げを止める)、
                     # 残りは PURGE 無しで後ろにキューし、続けて滑らかに読ませる。
                     first, rest = _split_first(arg)
-                    voice.Speak(first, SVSF_ASYNC | SVSF_PURGE)
+                    voice.Speak(first, SVSF_ASYNC | SVSF_PURGE | SVSF_IS_NOT_XML)
                     if rest:
-                        voice.Speak(rest, SVSF_ASYNC)
+                        voice.Speak(rest, SVSF_ASYNC | SVSF_IS_NOT_XML)
                     self._speaking = True
                 elif cmd == "stop":
                     voice.Speak("", SVSF_ASYNC | SVSF_PURGE)
@@ -143,14 +190,37 @@ class SpeechEngine:
                     voice.Rate = max(-10, min(10, int(arg)))
                 elif cmd == "voice":
                     self._apply_voice(voice, arg)
-            except pythoncom.com_error:
-                pass  # 音声デバイス切替等の一時的なエラーで常駐を落とさない
+            except (pythoncom.com_error, TypeError, ValueError, OverflowError,
+                    AttributeError):
+                # 音声デバイス切替等の一時的なエラーや、不正な話速・音声名(数値化できない値、
+                # inf、None 等)で、この専用スレッドが死んで以後の読み上げが無音になるのを防ぐ。
+                pass
+
+    @staticmethod
+    def _pick_voice(descriptions, name):
+        """name に合う音声の添字を返す(無ければ None)。
+
+        完全一致を最優先し、部分一致では Online 版より手元で合成する音声を先に選ぶ。
+        「Microsoft Nanami」のような名前が列挙順次第で Online 版(本文を Microsoft へ
+        送信する)に当たるのを防ぐ。name 自体に online を含めば Online 版も選べる。
+        空の名前は全音声に部分一致してしまうので何も選ばない。
+        """
+        if not isinstance(name, str) or not name.strip():
+            return None
+        want = name.lower()
+        lowered = [d.lower() for d in descriptions]
+        if want in lowered:
+            return lowered.index(want)
+        hits = [i for i, d in enumerate(lowered) if want in d]
+        if "online" not in want:
+            hits = [i for i in hits if "online" not in lowered[i]] or hits
+        return hits[0] if hits else None
 
     @staticmethod
     def _apply_voice(voice, name):
         tokens = voice.GetVoices()
-        for i in range(tokens.Count):
-            token = tokens.Item(i)
-            if name.lower() in token.GetDescription().lower():
-                voice.Voice = token
-                return
+        count = tokens.Count
+        descriptions = [tokens.Item(i).GetDescription() for i in range(count)]
+        idx = SpeechEngine._pick_voice(descriptions, name)
+        if idx is not None:
+            voice.Voice = tokens.Item(idx)

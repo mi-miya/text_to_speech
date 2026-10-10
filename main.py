@@ -59,7 +59,10 @@ def hotkey_down():
 
 def normalize(text):
     text = re.sub(r"[ \t　]+", " ", text)
-    text = re.sub(r"\r?\n+", "\n", text)
+    # \r\n と \n で段落の扱いが変わらないよう、先に改行コードを揃える。
+    # 空行(段落区切り)は 1 つ残し、3 連続以上の改行だけ詰める。
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
@@ -71,13 +74,19 @@ def resolve_voice(configured, voices):
     for name in voices:
         if name.lower() == configured_lower:
             return name
+    # 部分一致は並び順で最初の音声が選ばれるため、"Nanami" のような短い指定が
+    # Online 音声に当たらないよう、指定自体に online と書かれていなければ除外する。
+    allow_online = "online" in configured_lower
     for name in voices:
-        if configured_lower in name.lower() or name.lower() in configured_lower:
+        lower = name.lower()
+        if not allow_online and "online" in lower:
+            continue
+        if configured_lower in lower or lower in configured_lower:
             return name
     # Natural Voice Adapter や音声モデルが一時的に消えた場合、オンライン音声を
-    # 勝手に選ぶと本文が外部へ送信され得る。まず Desktop/非 Online を選ぶ。
-    return next((name for name in voices if "online" not in name.lower()),
-                voices[0] if voices else None)
+    # 勝手に選ぶと本文が外部へ送信され得る。非 Online が無ければ None を返し、
+    # 呼び出し側は音声を変えずシステム既定のまま読み上げる。
+    return next((name for name in voices if "online" not in name.lower()), None)
 
 
 class FloatingWidget:
@@ -129,6 +138,7 @@ class FloatingWidget:
         self._rate_win = None       # 話速調整ウィンドウ(単一インスタンス)
         self._rate_scale = None
         self._rate_save_job = None  # ドラッグ確定を遅延保存するための after id
+        self._flash_job = None      # 橙フラッシュ解除の after id
 
         self._poll_state()
 
@@ -222,7 +232,10 @@ class FloatingWidget:
 
     def _reset_rate(self):
         if self._rate_scale is not None:
-            self._rate_scale.set(0)  # _on_rate_slide が呼ばれ即時反映される
+            self._rate_scale.set(0)
+        # Scale.set のコールバックは idle 時に遅れて呼ばれるため、それを待たずに
+        # 0 を反映してから保存する(待つと旧値が保存され、終了で失われ得る)
+        self.app.set_rate(0, persist=False)
         self._persist_rate()
 
     def _close_rate_dialog(self):
@@ -269,9 +282,13 @@ class FloatingWidget:
     def _do_flash(self):
         self._flashing = True
         self.canvas.itemconfig(self.circle, fill=COLOR_ERROR)
-        self.root.after(900, self._end_flash)
+        # 連続で失敗したとき、前回の解除予約が新しい点灯を早く消さないよう取り消す
+        if self._flash_job is not None:
+            self.root.after_cancel(self._flash_job)
+        self._flash_job = self.root.after(900, self._end_flash)
 
     def _end_flash(self):
+        self._flash_job = None
         self._flashing = False
 
     def run(self):
@@ -323,6 +340,11 @@ class App:
         elif msg == WM_LBUTTONUP and self._swallow_up:
             self._swallow_up = False
             self.mouse_listener.suppress_event()
+        elif msg == WM_LBUTTONDOWN:
+            # ホットキー無しの押下は対象アプリへ渡る。前回抑制した down の up が
+            # 届かなかった場合に旗が残っていると、この押下の up を握りつぶして
+            # 対象アプリ側にボタン押しっぱなしが残るため、新しい押下で必ず解除する。
+            self._swallow_up = False
         return True
 
     def _on_key_press(self, key):
@@ -350,6 +372,9 @@ class App:
     def quit(self):
         self.stop()
         try:
+            # 話速スライダーの遅延保存(500ms)待ちのまま os._exit すると
+            # 直前の変更が失われるため、終了前に必ず書き出す。
+            self.config.save()
             self.mouse_listener.stop()
             self.keyboard_listener.stop()
             self.widget.root.destroy()

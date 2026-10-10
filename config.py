@@ -12,6 +12,20 @@ DEFAULTS = {
 }
 
 
+def _to_int(value):
+    """設定値を整数へ変換する。変換できない値(型違い・真偽値・inf/NaN)は None。
+
+    bool は int の派生で int(True) == 1 になってしまうため明示的に除外する。
+    inf は int() が ValueError ではなく OverflowError を投げる。
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 class Config:
     def __init__(self):
         self._data = dict(DEFAULTS)
@@ -20,32 +34,30 @@ class Config:
 
     def load(self):
         try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            # utf-8-sig: メモ帳等で保存された BOM 付きでも読める(通常の UTF-8 も可)。
+            # BOM があると utf-8 では JSON が不正扱いになり、設定が全て既定に戻ってしまう。
+            with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
                 saved = json.load(f)
             if not isinstance(saved, dict):
                 return
 
-            if "rate" in saved:
-                try:
-                    self._data["rate"] = max(-10, min(10, int(saved["rate"])))
-                except (TypeError, ValueError):
-                    pass
+            rate = _to_int(saved.get("rate"))
+            if rate is not None:
+                self._data["rate"] = max(-10, min(10, rate))
             voice = saved.get("voice")
             if voice is None or isinstance(voice, str):
                 self._data["voice"] = voice
-            if "max_chars" in saved:
-                try:
-                    self._data["max_chars"] = max(
-                        100, min(1_000_000, int(saved["max_chars"])))
-                except (TypeError, ValueError):
-                    pass
+            max_chars = _to_int(saved.get("max_chars"))
+            if max_chars is not None:
+                self._data["max_chars"] = max(100, min(1_000_000, max_chars))
             pos = saved.get("pos")
             if isinstance(pos, (list, tuple)) and len(pos) == 2:
-                try:
-                    self._data["pos"] = [int(pos[0]), int(pos[1])]
-                except (TypeError, ValueError):
-                    pass
-        except (OSError, ValueError):
+                x, y = _to_int(pos[0]), _to_int(pos[1])
+                if x is not None and y is not None:
+                    self._data["pos"] = [x, y]
+        # RecursionError: 極端に深い入れ子の JSON。壊れた設定で起動不能にならないよう
+        # 読み込み失敗として扱う(UnicodeDecodeError / JSONDecodeError は ValueError 派生)。
+        except (OSError, ValueError, RecursionError):
             pass
 
     def save(self):
