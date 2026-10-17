@@ -104,6 +104,12 @@ TILE_MIN_ITEMS = 5     # これ未満の兄弟では並びを判断しない(投
 TILE_TOLERANCE = 3     # 並びどおりとみなす誤差 (px)
 TILE_MAJORITY = 0.6    # 兄弟のうちこの割合が並びどおりなら、縦のリストとみなす
 TILE_WALK_UP = 16      # リストを探して親を辿る最大段数
+TILE_STALE_MIN = 24    # 古い矩形とみなす最小のずれ (px)。これより小さいずれは
+                       # 項目間の余白(Claude の最後のメッセージだけ 7px 空く等)で、
+                       # 矩形は正しい。補正すると余白へ外れて取得失敗になっていた。
+                       # 本当に古い矩形は投稿 1 件ぶん以上ずれる(実測 463px)。
+PAD_NEAR = 32          # クリックした要素の文字がクリック位置からこの距離 (px) 以内なら、
+                       # 要素の余白(表のセルの下側など)を押したとみなす
 
 TREE_SCOPE_DESCENDANTS = 4 # UIA の TreeScope_Descendants (uiautomation は定数を公開していない)
 
@@ -339,6 +345,8 @@ class TextCapturer(threading.Thread):
         if target is None:
             return None
         shift = slots[target][2]
+        if abs(shift) < TILE_STALE_MIN:
+            return None   # 余白による小さな食い違い。矩形は信用できる
         on_path = None
         if below is not None:
             for i, child in enumerate(children):
@@ -1153,6 +1161,7 @@ class TextCapturer(threading.Thread):
         # その場合だけ取り直す。矩形が取れていて位置が違うなら、それは本当に別の
         # 場所なので取り直さず座標探索へ回す。
         seed = None
+        padded = None   # クリック位置のすぐ近くに文字がある、クリックした要素の範囲
         for attempt in range(RANGE_RETRY):
             if attempt:
                 # Chromium はツリーを遅延構築する。待たずに取り直しても同じ結果に
@@ -1171,11 +1180,24 @@ class TextCapturer(threading.Thread):
                 continue
             if log is not None:
                 log.append("  開始種: 要素範囲がクリック位置を含まず → 座標から探索")
+            # 数行ぶんの小さな要素に限る。本文全体のような大きな入れ物の余白で
+            # これを使うと、押した場所と無関係な先頭から読んでしまう。
+            rects = _rects(cand)
+            if (not _is_document(control) and _rects_gap(rects, y) <= PAD_NEAR
+                    and _rects_height(rects) <= PAD_NEAR * 3):
+                padded = cand
             break
         if log is not None:
             log.append("  開始種: クリックした要素の範囲を使用" if seed is not None
                        else "  開始種: 座標から探索")
         r, matched = self._start_range_at_point(pattern, x, y, log, seed=seed)
+        if not matched and padded is not None:
+            # 表のセルやダイアログの行の、文字の上下の余白を押した場合。座標→文字は
+            # 余白に文字が無いので行を特定できないが、押した要素そのものは矩形で
+            # 確定している。その要素の先頭から読む(従来は取得失敗になっていた)。
+            if log is not None:
+                log.append("=> 行特定: 要素の余白を押した → 要素の先頭から読む")
+            r, matched = padded.Clone(), True
         if r is None:
             return ""
         # 粗いノード(文書全体)を種にしたうえ矩形でも行を特定できていないなら、
@@ -1347,6 +1369,26 @@ def _rects_side(rects, y):
     if y >= bottom:
         return 1
     return 0
+
+
+def _rects_gap(rects, y):
+    """外接矩形群とクリック位置の縦の距離 (px)。含めば 0、矩形が無ければ無限大。"""
+    if not rects:
+        return float("inf")
+    top = min(r.top for r in rects)
+    bottom = max(r.bottom for r in rects)
+    if y < top:
+        return top - y
+    if y >= bottom:
+        return y - bottom + 1
+    return 0
+
+
+def _rects_height(rects):
+    """外接矩形群が縦に占める高さ (px)。"""
+    if not rects:
+        return 0
+    return max(r.bottom for r in rects) - min(r.top for r in rects)
 
 
 def _range_side(text_range, y):

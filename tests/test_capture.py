@@ -160,8 +160,9 @@ class _FakeRange:
         return moved
 
     def MoveEndpointByRange(self, endpoint, other, other_endpoint, waitTime=0):
-        # 本番コードは End を自身の Start へ畳む用途にしか使わない
+        # End を自身の Start へ畳む / 文書末尾まで伸ばす用途に使う
         self.end = other.start if other_endpoint == Start else other.end
+        return True
 
     def GetBoundingRectangles(self):
         rects = []
@@ -415,6 +416,71 @@ class TilingSlotsTests(unittest.TestCase):
 
     def test_too_few_items_are_not_judged(self):
         self.assertIsNone(_tiling_slots(self.RECTS[:3]))
+
+
+class _FakeItem:
+    def __init__(self, rect):
+        self.BoundingRectangle = _FakeRect(*rect)
+        self.ControlTypeName = "GroupControl"
+
+    def GetChildren(self):
+        return []
+
+    def GetRuntimeId(self):
+        return id(self)
+
+
+class RetargetThresholdTests(unittest.TestCase):
+    def setUp(self):
+        self.capturer = TextCapturer(lambda t: None, lambda: None, debug=False)
+
+    def test_a_small_gap_before_an_item_is_not_treated_as_stale(self):
+        # Claude の実測: 最後のメッセージだけ 7px の余白があり、補正すると
+        # クリック位置が余白へ外れて取得失敗になっていた
+        rects = [(0, i * 100, 600, i * 100 + 100) for i in range(12)]
+        rects.append((0, 1207, 600, 1400))
+        children = [_FakeItem(r) for r in rects]
+        self.assertIsNone(self.capturer._retarget_in_list(children, None, 300, 1300))
+
+    def test_a_large_shift_is_still_corrected(self):
+        children = [_FakeItem(r) for r in TilingSlotsTests.RECTS]
+        fixed = self.capturer._retarget_in_list(children, None, 300, -100)
+        self.assertIsNotNone(fixed)
+        self.assertIs(children[4], fixed[0])
+        self.assertEqual(-100 - 463, fixed[2])
+
+
+class _Element:
+    ControlTypeName = "GroupControl"
+
+
+class PaddingClickTests(unittest.TestCase):
+    """表のセルなど、要素の文字のすぐ下の余白を押した場合(freee の実測)。"""
+
+    def setUp(self):
+        self.capturer = TextCapturer(lambda t: None, lambda: None, debug=False)
+        self.cell = _FakeRange("売掛金" + "x" * 50, 0, 3)   # 1 行目 (y=0..20)
+        self.capturer._range_from_child = lambda pattern, child: self.cell.Clone()
+        self.capturer._start_range_at_point = (
+            lambda pattern, x, y, log=None, seed=None: (_FakeRange("無関係"), False))
+
+    def _read_with_document(self, control, y):
+        class _Pattern:
+            DocumentRange = _FakeRange("売掛金" + "x" * 50)
+        return self.capturer._read_to_boundary(
+            _Pattern(), control, None, 10, y, coarse=True, log=[])
+
+    def test_clicking_just_below_the_text_reads_from_the_element(self):
+        text = self._read_with_document(_Element(), 35)
+        self.assertTrue(text.startswith("売掛金"))
+
+    def test_a_click_far_from_the_text_still_fails(self):
+        self.assertEqual("", self._read_with_document(_Element(), 120))
+
+    def test_the_document_itself_is_not_an_element_to_fall_back_to(self):
+        doc = _Element()
+        doc.ControlTypeName = "DocumentControl"
+        self.assertEqual("", self._read_with_document(doc, 35))
 
 
 class CountOnlyTests(unittest.TestCase):
