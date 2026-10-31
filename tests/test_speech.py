@@ -108,6 +108,46 @@ class EngineRobustnessTests(unittest.TestCase):
         self.assertEqual(1, len(calls))
         self.assertTrue(calls[0][1] & speech.SVSF_IS_NOT_XML)
 
+    def test_output_is_woken_before_speaking_and_stop_cancels_the_wait(self):
+        calls = []
+
+        class FakeVoice:
+            Rate = 0
+
+            def Speak(self, text, flags):
+                calls.append(text)
+
+        class FakeWake:
+            def ensure_awake(self, cancelled):
+                calls.append("wake")
+                if text == "止める":
+                    engine.stop()
+                    while not cancelled():
+                        time.sleep(0.01)
+
+            def close(self):
+                pass
+
+        with mock.patch.object(speech.win32com.client, "Dispatch",
+                               return_value=FakeVoice()), \
+                mock.patch.object(speech, "OutputWake", FakeWake):
+            engine = SpeechEngine()
+            text = "読む"
+            engine.speak(text)
+            deadline = time.time() + 3
+            while len(calls) < 2 and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(["wake", "読む"], calls)
+
+            calls.clear()
+            text = "止める"
+            engine.speak(text)
+            deadline = time.time() + 3
+            while "" not in calls and time.time() < deadline:
+                time.sleep(0.01)
+
+        self.assertEqual(["wake", ""], calls)  # 待っている間の停止で本文は読まない
+
 
 if __name__ == "__main__":
     unittest.main()

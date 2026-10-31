@@ -8,10 +8,13 @@ SAPI 音声として見えるようになり、このコードのまま使える
 import queue
 import re
 import threading
+import time
 import unicodedata
 
 import pythoncom
 import win32com.client
+
+from audio_wake import OutputWake
 
 SVSF_ASYNC = 1
 SVSF_PURGE = 2
@@ -129,6 +132,7 @@ def list_voices():
 
 
 SRSE_DONE = 1  # SpeechRunState: 再生完了
+WAKE_HOLD_SECONDS = 30  # 読み終えてから出力を起こしたままにする時間(続けて読むときの待ちをなくす)
 
 
 class SpeechEngine:
@@ -159,9 +163,15 @@ class SpeechEngine:
     def set_voice(self, name):
         self._q.put(("voice", name))
 
+    def _superseded(self):
+        """新しい読み上げや停止が待っていれば、今の読み上げは始めない。"""
+        return any(cmd in ("speak", "stop") for cmd, _ in list(self._q.queue))
+
     def _run(self):
         pythoncom.CoInitialize()
         voice = win32com.client.Dispatch("SAPI.SpVoice")
+        wake = OutputWake()
+        quiet_since = time.monotonic()
         while True:
             try:
                 cmd, arg = self._q.get(timeout=0.3)
@@ -173,16 +183,22 @@ class SpeechEngine:
                             self._speaking = False
                     except pythoncom.com_error:
                         self._speaking = False
+                    quiet_since = time.monotonic()
+                elif time.monotonic() - quiet_since >= WAKE_HOLD_SECONDS:
+                    wake.close()
                 continue
             try:
                 if cmd == "speak":
+                    self._speaking = True
+                    wake.ensure_awake(self._superseded)
+                    if self._superseded():
+                        continue
                     # 最初の一文だけ即座に再生(PURGE で前の読み上げを止める)、
                     # 残りは PURGE 無しで後ろにキューし、続けて滑らかに読ませる。
                     first, rest = _split_first(arg)
                     voice.Speak(first, SVSF_ASYNC | SVSF_PURGE | SVSF_IS_NOT_XML)
                     if rest:
                         voice.Speak(rest, SVSF_ASYNC | SVSF_IS_NOT_XML)
-                    self._speaking = True
                 elif cmd == "stop":
                     voice.Speak("", SVSF_ASYNC | SVSF_PURGE)
                     self._speaking = False
