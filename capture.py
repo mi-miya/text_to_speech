@@ -111,6 +111,22 @@ TILE_STALE_MIN = 24    # 古い矩形とみなす最小のずれ (px)。これ�
 PAD_NEAR = 32          # クリックした要素の文字がクリック位置からこの距離 (px) 以内なら、
                        # 要素の余白(表のセルの下側など)を押したとみなす
 
+# Chrome がページの中身をまだ UI Automation に渡していない(ページの切り替え直後
+# など)と、ページの入れ物 "Chrome Legacy Window" だけが空のまま返る。中身が
+# 出てくるのを少し長めに待ってから取り直す。それでも無ければすぐ失敗にする
+# (以前はここから 2 秒以上かけて集約し、結局失敗していた)。
+EMPTY_PAGE_RETRY = 5
+EMPTY_PAGE_RETRY_DELAY = 0.1
+EMPTY_PAGE_CLASS = "Chrome_RenderWidgetHostHWND"
+EMPTY_PAGE_NAME = "Chrome Legacy Window"
+# この高さ以上の画像は、本文の上に重なった大きな入れ物とみなす。Google マップの
+# 左の欄では、クチコミの上を押しても欄全体を覆う画像が返ることがあり、そのまま
+# 読むとページ先頭の検索欄から読み上げていた。
+COVER_IMAGE_MIN = 300
+# 押した要素の先頭の行が、スクロールで欄の上へ隠れていて矩形が取れないとき、
+# 押した位置の行を探して先へ進む行数の上限(要素の中だけを進む)。
+CLIPPED_WALK_MAX = 64
+
 TREE_SCOPE_DESCENDANTS = 4 # UIA の TreeScope_Descendants (uiautomation は定数を公開していない)
 
 Start = auto.TextPatternRangeEndpoint.Start
@@ -379,7 +395,9 @@ class TextCapturer(threading.Thread):
         descended = 0
         leaf = False
         settled = False   # 全要素の矩形検索でクリック対象を確定できたか
-        for attempt in range(CLICK_TARGET_RETRY):
+        attempt = 0
+        empty_waits = 0   # ページの中身が空だったので待った回数
+        while attempt < CLICK_TARGET_RETRY:
             try:
                 hit = auto.ControlFromPoint(x, y)
                 control, descended, leaf = self._resolve_click_target(
@@ -396,11 +414,33 @@ class TextCapturer(threading.Thread):
             except Exception as e:
                 log.append(f"=> クリック対象取得失敗(試行{attempt + 1}): "
                            f"{type(e).__name__}")
+            if _is_empty_page(control):
+                # 葉に見えるが、中身がまだ渡されていないだけ。回数を数え直して待つ
+                if empty_waits >= EMPTY_PAGE_RETRY:
+                    log.append("=> ページの中身がまだ読めない(Chrome が準備中)→ 取得失敗")
+                    return None
+                empty_waits += 1
+                log.append(f"=> ページの中身が空(待機{empty_waits}) → 取り直す")
+                time.sleep(EMPTY_PAGE_RETRY_DELAY)
+                continue
             if leaf or settled:
                 break
             log.append(f"=> クリック対象が葉に届かず(試行{attempt + 1}) → 取り直す")
-            if attempt + 1 < CLICK_TARGET_RETRY:
+            attempt += 1
+            if attempt < CLICK_TARGET_RETRY:
                 time.sleep(CLICK_TARGET_RETRY_DELAY)
+
+        if _is_cover_image(control):
+            # 本文の上に重なった大きな画像。全要素の矩形から、押した位置の本当の
+            # 要素(クチコミの文など)を探し直す。見つからなければ、ページ先頭から
+            # 読み上げるより失敗を選ぶ。
+            doc = _document_of(control)
+            found = self._search_by_rect(doc, x, y, log) if doc is not None else None
+            if found is None or _is_cover_image(found) or _is_document(found):
+                log.append("=> 大きな画像を押した(本文が見つからない)→ 取得失敗")
+                return None
+            control, _, leaf = self._resolve_click_target(found, x, y, log)
+            log.append("=> 大きな画像の下の要素を選び直した")
 
         fixed = self._retarget_stale(control, x, y, log)
         if fixed is not None:
@@ -664,6 +704,13 @@ class TextCapturer(threading.Thread):
                 seed = None
         if seed is None:
             return None, False
+        # 要素の範囲そのもの(行に広げる前)。先頭の行が隠れているときに使う
+        element = None
+        try:
+            if _range_side(seed, y) == 0:
+                element = seed.Clone()
+        except Exception:
+            element = None
         try:
             seed.ExpandToEnclosingUnit(auto.TextUnit.Line, waitTime=0)
         except Exception:
@@ -715,6 +762,16 @@ class TextCapturer(threading.Thread):
             if log is not None:
                 log.append("=> 行特定: RangeFromPoint の行がクリック位置と一致")
             return start_at(seed), True
+        if side is None and element is not None:
+            # 押した要素はクリック位置を含むのに、その先頭の行だけ矩形が取れない
+            # = 先頭の行がスクロールで欄の上へ隠れている(Google マップのクチコミ)。
+            # 隠れた行はクリックより手前にあるので、要素の中を 1 行ずつ進んで
+            # 押した行を探す。以前は隠れた行を「行き過ぎ」と扱い、どこを押しても
+            # 要素の先頭から読み上げていた。
+            walked = self._walk_past_hidden_head(seed, element, y, log)
+            if walked is not None:
+                r, matched = walked
+                return start_at(r), matched
         # 矩形が取れない(行が画面外)場合、Chromium 系では seed は要素先頭 =
         # クリック位置より前にあるのが通例なので、前方へ進みながら探す。
         if side is None:
@@ -793,6 +850,45 @@ class TextCapturer(threading.Thread):
         if log is not None:
             log.append(f"=> 行特定: {final} 行移動で確定(矩形一致なし 探索{probes[0]}回)")
         return start_at(r or seed), False
+
+    def _walk_past_hidden_head(self, line, element, y, log=None):
+        """要素の先頭の隠れた行を飛ばし、クリック行を探す。(範囲, 一致したか) か None。
+
+        要素の外へは出ない。矩形の取れる行でクリック位置を跨いだら(行間を押した)、
+        その直前の行を採る。押した箇所を読み飛ばさないため。
+        """
+        r = line
+        before = None   # 矩形が取れた行のうち、クリックより上にある最後の行
+        for n in range(1, CLIPPED_WALK_MAX + 1):
+            try:
+                r = r.Clone()
+                if not r.Move(auto.TextUnit.Line, 1, waitTime=0):
+                    break
+                r.ExpandToEnclosingUnit(auto.TextUnit.Line, waitTime=0)
+                if r.CompareEndpoints(Start, element, End) >= 0:
+                    break   # 要素の外へ出た
+            except Exception:
+                break
+            s = _range_side(r, y)
+            if s is None:
+                continue
+            if s == 0:
+                if log is not None:
+                    log.append(f"=> 行特定: 隠れた先頭行を飛ばして {n} 行先で一致")
+                return r, True
+            if s == 1:
+                before = r
+                continue
+            # クリック位置を跨いだ(行間を押した)。直前の行、無ければこの行から読む。
+            # どちらも矩形で位置を確かめた、押した要素の中の行。
+            if log is not None:
+                log.append("=> 行特定: 隠れた先頭行を飛ばし、クリック位置の隣の行を採用")
+            return (before or r), True
+        if before is not None:
+            if log is not None:
+                log.append("=> 行特定: 隠れた先頭行を飛ばし、クリック位置の直前の行を採用")
+            return before, True
+        return None
 
     def _refine_to_click_line(self, text_range, y, log=None):
         """複数行にまたがる範囲を、クリック行の先頭から始まる範囲に切り詰める。
@@ -1290,6 +1386,52 @@ def _is_document(node):
         return node.ControlTypeName == "DocumentControl"
     except Exception:
         return False
+
+
+def _is_empty_page(node):
+    """Chrome のページの入れ物だけが、中身(文書)を持たずに返ってきたか。"""
+    if node is None:
+        return False
+    try:
+        if node.ControlTypeName != "PaneControl":
+            return False
+        cls = node.ClassName or ""
+        name = node.Name or ""
+    except Exception:
+        return False
+    if cls != EMPTY_PAGE_CLASS and name != EMPTY_PAGE_NAME:
+        return False
+    try:
+        return not node.GetChildren()
+    except Exception:
+        return True
+
+
+def _is_cover_image(node):
+    """本文の上に重なるほど大きな画像か。"""
+    if node is None:
+        return False
+    try:
+        if node.ControlTypeName != "ImageControl":
+            return False
+        r = node.BoundingRectangle
+        return r.bottom - r.top >= COVER_IMAGE_MIN
+    except Exception:
+        return False
+
+
+def _document_of(node):
+    """node を含む文書 (DocumentControl)。見つからなければ None。"""
+    for _ in range(MAX_WALK_UP):
+        if node is None:
+            return None
+        if _is_document(node):
+            return node
+        try:
+            node = node.GetParentControl()
+        except Exception:
+            return None
+    return None
 
 
 def _tiling_slots(rects):

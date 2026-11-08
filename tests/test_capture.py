@@ -361,6 +361,101 @@ class LineSeekIntoUnmeasurableRegionTests(unittest.TestCase):
         self.assertEqual(self.TEXT[32:40], rng.GetText())
 
 
+class _HiddenHeadRange(_LineRange):
+    """先頭の HIDDEN_LINES 行がスクロールで欄の上へ隠れ、矩形が取れない TextRange。"""
+
+    HIDDEN_LINES = 2
+    MEASURED_LINES = 99
+
+    def Clone(self):
+        return _HiddenHeadRange(self.text, self.start, self.end)
+
+    def CompareEndpoints(self, src, other, target):
+        mine = self.start if src == Start else self.end
+        theirs = other.start if target == Start else other.end
+        return mine - theirs
+
+    def GetBoundingRectangles(self):
+        limit = self.HIDDEN_LINES * self.LINE_LEN
+        rects = super().GetBoundingRectangles()
+        return [r for n, r in zip(range(self.start, self.end), rects) if n >= limit]
+
+
+class HiddenHeadLineTests(unittest.TestCase):
+    """押した要素の先頭の行が隠れていても、押した行から読む(要素の先頭に戻らない)。"""
+
+    TEXT = "0123456789" * 6
+
+    def setUp(self):
+        self.capturer = TextCapturer(lambda t: None, lambda: None, debug=False)
+
+    def test_reading_starts_at_the_clicked_line_below_hidden_lines(self):
+        # 1, 2 行目は隠れている。4 行目 (y=60..80) の 3 文字目 (x=16..24) を押す
+        rng, verified = self.capturer._start_range_at_point(
+            None, 20, 70, seed=_HiddenHeadRange(self.TEXT))
+        self.assertTrue(verified)
+        self.assertEqual(self.TEXT[32:40], rng.GetText())
+
+    def test_the_first_visible_line_can_be_clicked(self):
+        rng, verified = self.capturer._start_range_at_point(
+            None, 0, 50, seed=_HiddenHeadRange(self.TEXT))
+        self.assertTrue(verified)
+        self.assertEqual(self.TEXT[20:30], rng.GetText())
+
+
+class _FakeNode:
+    def __init__(self, kind, name="", cls="", rect=(0, 0, 100, 100), children=(),
+                 parent=None):
+        self.ControlTypeName = kind
+        self.Name = name
+        self.ClassName = cls
+        self.BoundingRectangle = _FakeRect(*rect)
+        self._children = list(children)
+        self._parent = parent
+
+    def GetChildren(self):
+        return self._children
+
+    def GetParentControl(self):
+        return self._parent
+
+
+class EmptyPageTests(unittest.TestCase):
+    def test_an_empty_chrome_page_container_is_detected(self):
+        node = _FakeNode("PaneControl", "Chrome Legacy Window",
+                         "Chrome_RenderWidgetHostHWND")
+        self.assertTrue(capture._is_empty_page(node))
+
+    def test_a_page_container_with_content_is_not_empty(self):
+        doc = _FakeNode("DocumentControl")
+        node = _FakeNode("PaneControl", "Chrome Legacy Window",
+                         "Chrome_RenderWidgetHostHWND", children=[doc])
+        self.assertFalse(capture._is_empty_page(node))
+
+    def test_other_leaf_panes_are_not_empty_pages(self):
+        self.assertFalse(capture._is_empty_page(_FakeNode("PaneControl", "メモ")))
+        self.assertFalse(capture._is_empty_page(None))
+
+
+class CoverImageTests(unittest.TestCase):
+    def test_a_tall_image_is_a_cover(self):
+        self.assertTrue(capture._is_cover_image(
+            _FakeNode("ImageControl", rect=(1900, 181, 2300, 1241))))
+
+    def test_a_small_image_or_text_is_not_a_cover(self):
+        self.assertFalse(capture._is_cover_image(
+            _FakeNode("ImageControl", rect=(0, 0, 40, 40))))
+        self.assertFalse(capture._is_cover_image(
+            _FakeNode("TextControl", rect=(0, 0, 400, 1000))))
+
+    def test_the_document_of_a_node_is_found_by_walking_up(self):
+        doc = _FakeNode("DocumentControl")
+        group = _FakeNode("GroupControl", parent=doc)
+        image = _FakeNode("ImageControl", parent=group)
+        self.assertIs(doc, capture._document_of(image))
+        self.assertIsNone(capture._document_of(_FakeNode("GroupControl")))
+
+
 class SmallestContainingTests(unittest.TestCase):
     def test_the_smallest_rect_containing_the_point_wins(self):
         rects = [(0, 0, 1000, 1000), (100, 100, 300, 130), (0, 0, 0, 0)]
