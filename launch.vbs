@@ -1,6 +1,6 @@
 ' Launch the text-to-speech tool without a console window.
 ' Double-click this file to start. To restart: right-click the
-' on-screen icon, choose Exit, then double-click this file again.
+' on-screen icon and choose the restart item (just above Exit).
 ' NOTE: keep this file ASCII-only (wscript reads VBS as ANSI).
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set WshShell = CreateObject("WScript.Shell")

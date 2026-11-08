@@ -5,6 +5,8 @@ SpVoice は生成したスレッドでのみ触る(COM のアパートメント�
 NaturalVoiceSAPIAdapter を導入すると、Microsoft の自然音声 (Nanami 等) が
 SAPI 音声として見えるようになり、このコードのまま使える。
 """
+import ctypes
+import os
 import queue
 import re
 import threading
@@ -134,11 +136,44 @@ def list_voices():
 SRSE_DONE = 1  # SpeechRunState: 再生完了
 WAKE_HOLD_SECONDS = 30  # 読み終えてから出力を起こしたままにする時間(続けて読むときの待ちをなくす)
 
+# 長く常駐していると、読み始めまでに何秒も待たされるようになることがある(取得は
+# 0.1 秒以内で済んでいるので、遅れは音声側)。再起動すると直るため、どこで詰まって
+# いるかを読み上げごとに記録し、遅かったときは音声エンジンを作り直す。
+SPEECH_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "speech_debug.log")
+SPEECH_LOG_KEEP = 300   # ログに残す行数
+START_POLL = 0.02       # 発声の始まりを見張る間隔(秒)
+START_GIVE_UP = 15.0    # これだけ待っても声が出なければ「発声せず」と記録する
+SLOW_START = 3.0        # クリックから声が出るまでがこれを超えたら、次の読み上げ前に作り直す
+
+
+def _working_set_mb():
+    """このプロセスの使用メモリ(MB)。取れなければ None。"""
+    class PMC(ctypes.Structure):
+        _fields_ = [("cb", ctypes.c_ulong), ("PageFaultCount", ctypes.c_ulong)] + [
+            (n, ctypes.c_size_t) for n in (
+                "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+                "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage",
+                "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage")]
+    try:
+        pmc = PMC()
+        pmc.cb = ctypes.sizeof(pmc)
+        kernel32 = ctypes.WinDLL("kernel32")
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        func = kernel32.K32GetProcessMemoryInfo
+        func.argtypes = [ctypes.c_void_p, ctypes.POINTER(PMC), ctypes.c_ulong]
+        if func(kernel32.GetCurrentProcess(), ctypes.byref(pmc), pmc.cb):
+            return pmc.WorkingSetSize // (1024 * 1024)
+    except (OSError, AttributeError):
+        pass
+    return None
+
 
 class SpeechEngine:
-    def __init__(self, rate=0, voice_name=None):
+    def __init__(self, rate=0, voice_name=None, log_path=SPEECH_LOG):
         self._q = queue.Queue()
         self._speaking = False
+        self._log_path = log_path
+        self._started_at = time.monotonic()
         self._q.put(("rate", rate))
         if voice_name:
             self._q.put(("voice", voice_name))
@@ -150,9 +185,10 @@ class SpeechEngine:
         return self._speaking
 
     def speak(self, text):
+        queued = time.monotonic()
         text = strip_unspoken(sanitize_for_sapi(text))
         if text.strip():
-            self._q.put(("speak", text))
+            self._q.put(("speak", (text, queued)))
 
     def stop(self):
         self._q.put(("stop", None))
@@ -163,54 +199,148 @@ class SpeechEngine:
     def set_voice(self, name):
         self._q.put(("voice", name))
 
+    def note(self, message):
+        """speech_debug.log に 1 行残す(書き込みは読み上げスレッドで行う)。"""
+        self._q.put(("note", message))
+
     def _superseded(self):
         """新しい読み上げや停止が待っていれば、今の読み上げは始めない。"""
         return any(cmd in ("speak", "stop") for cmd, _ in list(self._q.queue))
 
+    # ---- 記録 ----
+
+    def _log(self, message):
+        if not self._log_path:
+            return
+        uptime = (time.monotonic() - self._started_at) / 60
+        mem = _working_set_mb()
+        line = (f"[{time.strftime('%m/%d %H:%M:%S')}] 起動後{uptime:.0f}分 "
+                f"メモリ={mem if mem is not None else '?'}MB {message}\n")
+        try:
+            try:
+                with open(self._log_path, encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()[-(SPEECH_LOG_KEEP - 1):]
+            except OSError:
+                lines = []
+            lines.append(line)
+            with open(self._log_path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+        except OSError:
+            pass  # 記録できなくても読み上げは止めない
+
+    # ---- 音声エンジン本体 ----
+
+    def _create_voice(self):
+        voice = win32com.client.Dispatch("SAPI.SpVoice")
+        if self._rate is not None:
+            voice.Rate = self._rate
+        if self._voice_name:
+            self._apply_voice(voice, self._voice_name)
+        return voice
+
+    @staticmethod
+    def _has_started(voice):
+        """最初の単語の発声に入ったか。完了済み・状態不明も「待つのをやめる」側に倒す。
+
+        InputWordLength は単語境界のイベントで更新され、実際に音が出始めた時点で
+        0 でなくなる(Nanami で確認。Speak 直後は RunningState だけ先に変わる)。
+        """
+        try:
+            status = voice.Status
+            return status.InputWordLength > 0 or status.RunningState == SRSE_DONE
+        except Exception:
+            return True
+
     def _run(self):
         pythoncom.CoInitialize()
-        voice = win32com.client.Dispatch("SAPI.SpVoice")
+        self._rate = None
+        self._voice_name = None
+        voice = self._create_voice()
         wake = OutputWake()
         quiet_since = time.monotonic()
+        pending = None      # 発声の始まりを見張っている読み上げ (queued, 各段階の時間, 文字数)
+        rebuild = False     # 前回の読み上げが遅かったので、次の読み上げ前に作り直す
         while True:
             try:
-                cmd, arg = self._q.get(timeout=0.3)
+                cmd, arg = self._q.get(timeout=START_POLL if pending else 0.3)
             except queue.Empty:
+                if pending:
+                    queued, stages, chars = pending
+                    total = time.monotonic() - queued
+                    if self._has_started(voice) or total >= START_GIVE_UP:
+                        pending = None
+                        started = total < START_GIVE_UP
+                        slow = not started or total >= SLOW_START
+                        rebuild = rebuild or slow
+                        self._log(f"{'遅い ' if slow else ''}"
+                                  f"{'発声まで' if started else '発声せず'}={total * 1000:.0f}ms "
+                                  f"({stages}) 文字={chars}")
+                    continue
                 # 再生が終わったかを定期的に確認して状態を更新する
                 if self._speaking:
                     try:
                         if voice.Status.RunningState == SRSE_DONE:
                             self._speaking = False
-                    except pythoncom.com_error:
+                    except Exception:
                         self._speaking = False
                     quiet_since = time.monotonic()
                 elif time.monotonic() - quiet_since >= WAKE_HOLD_SECONDS:
                     wake.close()
                 continue
+            if cmd in ("speak", "stop") and pending:
+                pending = None
+                self._log(f"始まる前に次の操作 ({cmd}) が来た")
             try:
                 if cmd == "speak":
+                    text, queued = arg
+                    t_dequeued = time.monotonic()
                     self._speaking = True
+                    if rebuild:
+                        rebuild = False
+                        try:
+                            voice.Speak("", SVSF_ASYNC | SVSF_PURGE)
+                        except Exception:
+                            pass
+                        wake.close()
+                        voice = self._create_voice()
+                        self._log(f"前回が遅かったので音声エンジンを作り直した "
+                                  f"({(time.monotonic() - t_dequeued) * 1000:.0f}ms)")
+                    t_wake = time.monotonic()
                     wake.ensure_awake(self._superseded)
                     if self._superseded():
                         continue
                     # 最初の一文だけ即座に再生(PURGE で前の読み上げを止める)、
                     # 残りは PURGE 無しで後ろにキューし、続けて滑らかに読ませる。
-                    first, rest = _split_first(arg)
+                    first, rest = _split_first(text)
+                    t_speak = time.monotonic()
                     voice.Speak(first, SVSF_ASYNC | SVSF_PURGE | SVSF_IS_NOT_XML)
+                    t_first = time.monotonic()
                     if rest:
                         voice.Speak(rest, SVSF_ASYNC | SVSF_IS_NOT_XML)
+                    t_rest = time.monotonic()
+                    ms = lambda a, b: f"{(b - a) * 1000:.0f}"
+                    stages = (f"待ち={ms(queued, t_dequeued)} 起こし={ms(t_wake, t_speak)} "
+                              f"Speak={ms(t_speak, t_first)}+{ms(t_first, t_rest)}")
+                    pending = (queued, stages, len(text))
                 elif cmd == "stop":
                     voice.Speak("", SVSF_ASYNC | SVSF_PURGE)
                     self._speaking = False
                 elif cmd == "rate":
                     voice.Rate = max(-10, min(10, int(arg)))
+                    self._rate = voice.Rate
                 elif cmd == "voice":
                     self._apply_voice(voice, arg)
+                    self._voice_name = arg
+                elif cmd == "note":
+                    self._log(arg)
             except (pythoncom.com_error, TypeError, ValueError, OverflowError,
-                    AttributeError):
+                    AttributeError) as e:
                 # 音声デバイス切替等の一時的なエラーや、不正な話速・音声名(数値化できない値、
                 # inf、None 等)で、この専用スレッドが死んで以後の読み上げが無音になるのを防ぐ。
-                pass
+                if cmd == "speak":
+                    pending = None
+                    rebuild = True  # COM の失敗は作り直しで直ることが多い
+                    self._log(f"読み上げで例外: {type(e).__name__}: {e}")
 
     @staticmethod
     def _pick_voice(descriptions, name):

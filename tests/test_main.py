@@ -38,6 +38,35 @@ class MainHelpersTests(unittest.TestCase):
         self.assertIsNone(resolve_voice("Missing", []))
 
 
+class AutoRestartTests(unittest.TestCase):
+    """長く動いた後の空き時間にだけ自動で再起動する判定。"""
+
+    def make_app(self, uptime, idle, speaking=False):
+        now = main.time.monotonic()
+        app = types.SimpleNamespace(
+            _started=now - uptime, _last_active=now - idle,
+            speech=types.SimpleNamespace(is_speaking=speaking))
+        app._mark_active = lambda: main.App._mark_active(app)
+        return app
+
+    def due(self, app, busy=False):
+        return main.App.auto_restart_due(app, busy=busy)
+
+    def test_restarts_only_after_long_uptime_and_long_idle(self):
+        long_up, long_idle = main.AUTO_RESTART_AFTER + 1, main.AUTO_RESTART_IDLE + 1
+        self.assertTrue(self.due(self.make_app(long_up, long_idle)))
+        self.assertFalse(self.due(self.make_app(long_up, 5)))         # さっき使った
+        self.assertFalse(self.due(self.make_app(60, long_idle)))      # 起動したばかり
+
+    def test_never_restarts_while_speaking_or_a_dialog_is_open(self):
+        long_up, long_idle = main.AUTO_RESTART_AFTER + 1, main.AUTO_RESTART_IDLE + 1
+        app = self.make_app(long_up, long_idle, speaking=True)
+        self.assertFalse(self.due(app))
+        app.speech.is_speaking = False
+        self.assertFalse(self.due(app))  # 読み終えた直後から、また空き時間を数え直す
+        self.assertFalse(self.due(self.make_app(long_up, long_idle), busy=True))
+
+
 class _Suppressed(Exception):
     pass
 
@@ -50,6 +79,7 @@ class MouseFilterTests(unittest.TestCase):
         self.keys_down = False
         self.app = types.SimpleNamespace(
             _swallow_up=False,
+            _mark_active=lambda: None,
             capturer=types.SimpleNamespace(
                 request=lambda x, y: self.requests.append((x, y))),
             mouse_listener=types.SimpleNamespace(suppress_event=self._suppress),

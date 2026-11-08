@@ -96,7 +96,7 @@ class EngineRobustnessTests(unittest.TestCase):
 
         with mock.patch.object(speech.win32com.client, "Dispatch",
                                return_value=FakeVoice()):
-            engine = SpeechEngine()
+            engine = SpeechEngine(log_path=None)
             for bad in ("abc", None, float("inf"), [1]):
                 engine.set_rate(bad)
             engine.speak("<speak>こんにちは</speak>")
@@ -131,7 +131,7 @@ class EngineRobustnessTests(unittest.TestCase):
         with mock.patch.object(speech.win32com.client, "Dispatch",
                                return_value=FakeVoice()), \
                 mock.patch.object(speech, "OutputWake", FakeWake):
-            engine = SpeechEngine()
+            engine = SpeechEngine(log_path=None)
             text = "読む"
             engine.speak(text)
             deadline = time.time() + 3
@@ -147,6 +147,52 @@ class EngineRobustnessTests(unittest.TestCase):
                 time.sleep(0.01)
 
         self.assertEqual(["wake", ""], calls)  # 待っている間の停止で本文は読まない
+
+    def test_slow_start_is_logged_and_voice_is_rebuilt_before_next_speak(self):
+        created = []
+        spoken = []
+
+        class Status:
+            RunningState = 2
+            InputWordLength = 0
+
+        class FakeVoice:
+            def __init__(self, progid=None):
+                self.Rate = 0
+                self.Status = Status()
+                created.append(self)
+
+            def Speak(self, text, flags):
+                spoken.append((len(created), text))
+                if text and len(created) > 1:
+                    self.Status.InputWordLength = 1  # 作り直した後はすぐ声が出る
+
+        class FakeWake:
+            def ensure_awake(self, cancelled):
+                pass
+
+            def close(self):
+                pass
+
+        logged = []
+        with mock.patch.object(speech.win32com.client, "Dispatch", side_effect=FakeVoice), \
+                mock.patch.object(speech, "OutputWake", FakeWake), \
+                mock.patch.object(speech, "SLOW_START", 0.1), \
+                mock.patch.object(speech, "START_GIVE_UP", 0.3), \
+                mock.patch.object(SpeechEngine, "_log", lambda self, m: logged.append(m)):
+            engine = SpeechEngine(rate=5, log_path=None)
+            engine.speak("一回目")
+            deadline = time.time() + 3
+            while not any("発声せず" in m for m in logged) and time.time() < deadline:
+                time.sleep(0.01)
+            engine.speak("二回目")
+            while not any("発声まで" in m for m in logged) and time.time() < deadline:
+                time.sleep(0.01)
+
+        self.assertEqual(2, len(created))
+        self.assertEqual(5, created[1].Rate)  # 作り直しても話速を引き継ぐ
+        self.assertIn((2, "二回目"), spoken)
+        self.assertTrue(any("作り直した" in m for m in logged))
 
 
 if __name__ == "__main__":

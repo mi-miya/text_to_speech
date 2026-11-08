@@ -19,7 +19,9 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
+import subprocess
 import threading
+import time
 import tkinter as tk
 import winsound
 
@@ -34,6 +36,9 @@ WM_LBUTTONUP = 0x0202
 VK_CONTROL = 0x11
 VK_MENU = 0x12  # Alt
 
+AUTO_RESTART_AFTER = 6 * 3600  # 起動からこれだけたったら、空き時間に自動で再起動する
+AUTO_RESTART_IDLE = 10 * 60     # 再起動するのは、読み上げも取得もしない状態がこれだけ続いたとき
+
 RATE_MIN = -10  # SAPI 話速の下限(最も遅い)
 RATE_MAX = 10   # SAPI 話速の上限(最も速い)。0 が標準。刻みはこの 21 段階が最小
 
@@ -43,13 +48,27 @@ COLOR_ERROR = "#E67E22"     # テキスト取得失敗: 橙 (一時的に点灯)
 TRANSPARENT = "#010101"     # ウィンドウを丸く見せるための透過色
 
 
+_mutex = None  # 再起動時に、新しいプロセスより先に手放すため保持する
+
+
 def ensure_single_instance():
-    ctypes.windll.kernel32.CreateMutexW(None, False, "ScreenReaderTool_Mutex")
-    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-        ctypes.windll.user32.MessageBoxW(
-            0, "読み上げツールは既に起動しています。\n画面上の丸いアイコンを探してください。",
-            "読み上げツール", 0x40)
-        sys.exit(0)
+    global _mutex
+    kernel32 = ctypes.windll.kernel32
+    # 再起動では古いプロセスが終わりきる直前に新しいプロセスが立ち上がる。
+    # 手放した直後でも取りこぼさないよう、少しだけ待ってから判定し直す。
+    for attempt in range(20):
+        _mutex = kernel32.CreateMutexW(None, False, "ScreenReaderTool_Mutex")
+        if kernel32.GetLastError() != 183:  # ERROR_ALREADY_EXISTS
+            return
+        kernel32.CloseHandle(_mutex)
+        _mutex = None
+        if "--restarted" not in sys.argv:
+            break
+        time.sleep(0.25)
+    ctypes.windll.user32.MessageBoxW(
+        0, "読み上げツールは既に起動しています。\n画面上の丸いアイコンを探してください。",
+        "読み上げツール", 0x40)
+    sys.exit(0)
 
 
 def hotkey_down():
@@ -163,6 +182,7 @@ class FloatingWidget:
         self.menu.add_cascade(label="音声", menu=voice_menu)
 
         self.menu.add_separator()
+        self.menu.add_command(label="再起動", command=self.app.restart)
         self.menu.add_command(label="終了", command=self.app.quit)
 
     def _show_menu(self, event):
@@ -271,6 +291,10 @@ class FloatingWidget:
         # capture スレッドは Event を立てるだけにし、Tk の操作は必ず
         # mainloop のスレッドで行う。Tkinter のスレッド間呼び出しによる
         # RuntimeError やまれな停止を防ぐ。
+        dialog_open = self._rate_win is not None and self._rate_win.winfo_exists()
+        if self.app.auto_restart_due(busy=dialog_open):
+            self.app.restart(auto=True)
+            return
         if self.app.capture_error_pending.is_set():
             self.app.capture_error_pending.clear()
             self._do_flash()
@@ -320,10 +344,30 @@ class App:
             # ようにする。現在の実行だけ、確実に存在する音声へフォールバックする。
             self.speech.set_voice(self.active_voice)
         self.widget = None
+        self._started = time.monotonic()
+        self._last_active = self._started
+        if "--auto" in sys.argv:
+            self.speech.note("起動 (空き時間の自動再起動)")
+        elif "--restarted" in sys.argv:
+            self.speech.note("起動 (メニューから再起動)")
+        else:
+            self.speech.note("起動")
+
+    def _mark_active(self):
+        self._last_active = time.monotonic()
+
+    def auto_restart_due(self, busy=False):
+        """長く動き続けた後、使っていない時間が続いたら再起動どきとみなす。"""
+        if busy or self.speech.is_speaking:
+            self._mark_active()
+        now = time.monotonic()
+        return (now - self._started >= AUTO_RESTART_AFTER
+                and now - self._last_active >= AUTO_RESTART_IDLE)
 
     # ---- テキスト取得 → 読み上げ ----
 
     def _on_text(self, text):
+        self._mark_active()
         self.speech.speak(normalize(text))
 
     def _on_capture_error(self):
@@ -334,6 +378,7 @@ class App:
 
     def _mouse_filter(self, msg, data):
         if msg == WM_LBUTTONDOWN and hotkey_down():
+            self._mark_active()
             self.capturer.request(data.pt.x, data.pt.y)
             self._swallow_up = True
             self.mouse_listener.suppress_event()
@@ -353,6 +398,7 @@ class App:
 
     def stop(self):
         """読み上げと、まだ完了していないテキスト取得をまとめて停止する。"""
+        self._mark_active()
         self.capturer.cancel()
         self.speech.stop()
 
@@ -368,6 +414,32 @@ class App:
         self.speech.set_voice(name)
 
     # ---- 起動・終了 ----
+
+    def restart(self, auto=False):
+        """動きが悪くなったとき用。新しいプロセスを立ち上げてから自分は終わる。
+
+        長く動かし続けると調子が落ちることがあるため、空き時間にも自動で呼ばれる。
+        """
+        self.stop()
+        try:
+            self.config.save()
+            self.mouse_listener.stop()
+            self.keyboard_listener.stop()
+        finally:
+            global _mutex
+            if _mutex:
+                ctypes.windll.kernel32.CloseHandle(_mutex)
+                _mutex = None
+            try:
+                subprocess.Popen(
+                    [sys.executable, os.path.abspath(__file__), "--restarted"]
+                    + (["--auto"] if auto else []),
+                    cwd=os.path.dirname(os.path.abspath(__file__)),
+                    creationflags=subprocess.DETACHED_PROCESS
+                    | subprocess.CREATE_NEW_PROCESS_GROUP,
+                    close_fds=True)
+            finally:
+                os._exit(0)
 
     def quit(self):
         self.stop()
