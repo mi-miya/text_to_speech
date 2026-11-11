@@ -169,12 +169,13 @@ def _working_set_mb():
 
 
 class SpeechEngine:
-    def __init__(self, rate=0, voice_name=None, log_path=SPEECH_LOG):
+    def __init__(self, rate=0, voice_name=None, log_path=SPEECH_LOG, volume=100):
         self._q = queue.Queue()
         self._speaking = False
         self._log_path = log_path
         self._started_at = time.monotonic()
         self._q.put(("rate", rate))
+        self._q.put(("volume", volume))
         if voice_name:
             self._q.put(("voice", voice_name))
         self._thread = threading.Thread(target=self._run, daemon=True, name="speech")
@@ -195,6 +196,9 @@ class SpeechEngine:
 
     def set_rate(self, rate):
         self._q.put(("rate", rate))
+
+    def set_volume(self, volume):
+        self._q.put(("volume", volume))
 
     def set_voice(self, name):
         self._q.put(("voice", name))
@@ -234,6 +238,8 @@ class SpeechEngine:
         voice = win32com.client.Dispatch("SAPI.SpVoice")
         if self._rate is not None:
             voice.Rate = self._rate
+        if self._volume is not None:
+            voice.Volume = self._volume
         if self._voice_name:
             self._apply_voice(voice, self._voice_name)
         return voice
@@ -254,6 +260,7 @@ class SpeechEngine:
     def _run(self):
         pythoncom.CoInitialize()
         self._rate = None
+        self._volume = None
         self._voice_name = None
         voice = self._create_voice()
         wake = OutputWake()
@@ -328,6 +335,9 @@ class SpeechEngine:
                 elif cmd == "rate":
                     voice.Rate = max(-10, min(10, int(arg)))
                     self._rate = voice.Rate
+                elif cmd == "volume":
+                    voice.Volume = max(0, min(100, int(arg)))
+                    self._volume = voice.Volume
                 elif cmd == "voice":
                     self._apply_voice(voice, arg)
                     self._voice_name = arg

@@ -6,6 +6,7 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 
 DEFAULTS = {
     "rate": 0,          # SAPI の話速 (-10 〜 10)
+    "volume": 100,      # SAPI の音量 (0 〜 100)
     "voice": None,      # 音声名の部分一致文字列。None なら既定の音声
     "max_chars": 30000, # 一度に読み上げる最大文字数
     "pos": [100, 100],  # フローティングアイコンの位置
@@ -44,6 +45,9 @@ class Config:
             rate = _to_int(saved.get("rate"))
             if rate is not None:
                 self._data["rate"] = max(-10, min(10, rate))
+            volume = _to_int(saved.get("volume"))
+            if volume is not None:
+                self._data["volume"] = max(0, min(100, volume))
             voice = saved.get("voice")
             if voice is None or isinstance(voice, str):
                 self._data["voice"] = voice
@@ -91,6 +95,16 @@ class Config:
         ため、ドラッグ中は persist=False で即時反映だけ行い、確定時に save() する。
         """
         self._data["rate"] = max(-10, min(10, int(value)))
+        if persist:
+            self.save()
+
+    @property
+    def volume(self):
+        return self._data["volume"]
+
+    def set_volume(self, value, persist=True):
+        """音量を更新する。persist の扱いは set_rate と同じ(ドラッグ中は保存しない)。"""
+        self._data["volume"] = max(0, min(100, int(value)))
         if persist:
             self.save()
 

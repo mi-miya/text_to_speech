@@ -108,6 +108,35 @@ class EngineRobustnessTests(unittest.TestCase):
         self.assertEqual(1, len(calls))
         self.assertTrue(calls[0][1] & speech.SVSF_IS_NOT_XML)
 
+    def test_volume_is_applied_clamped_and_bad_values_do_not_kill_worker(self):
+        spoken = []
+
+        class FakeVoice:
+            Rate = 0
+            Volume = 100
+
+            def Speak(self, text, flags):
+                spoken.append((text, self.Volume))
+
+        with mock.patch.object(speech.win32com.client, "Dispatch",
+                               return_value=FakeVoice()):
+            engine = SpeechEngine(log_path=None, volume=30)
+            engine.speak("一")
+            # 次の読み上げが待っていると今の読み上げは飛ばされるので、読まれるまで待つ
+            deadline = time.time() + 3
+            while not spoken and time.time() < deadline:
+                time.sleep(0.01)
+            for bad in ("abc", None, float("inf")):
+                engine.set_volume(bad)
+            engine.set_volume(150)
+            engine.speak("二")
+            deadline = time.time() + 3
+            while len(spoken) < 2 and time.time() < deadline:
+                time.sleep(0.01)
+
+        self.assertTrue(engine._thread.is_alive())
+        self.assertEqual([("一", 30), ("二", 100)], spoken)
+
     def test_output_is_woken_before_speaking_and_stop_cancels_the_wait(self):
         calls = []
 
@@ -175,12 +204,20 @@ class EngineRobustnessTests(unittest.TestCase):
                 pass
 
         logged = []
+        mine = []
+
+        def log_mine(self, message):
+            # ほかのテストで動いたままのエンジンのログ(「発声まで」など)を拾わない
+            if self in mine:
+                logged.append(message)
+
         with mock.patch.object(speech.win32com.client, "Dispatch", side_effect=FakeVoice), \
                 mock.patch.object(speech, "OutputWake", FakeWake), \
                 mock.patch.object(speech, "SLOW_START", 0.1), \
                 mock.patch.object(speech, "START_GIVE_UP", 0.3), \
-                mock.patch.object(SpeechEngine, "_log", lambda self, m: logged.append(m)):
-            engine = SpeechEngine(rate=5, log_path=None)
+                mock.patch.object(SpeechEngine, "_log", log_mine):
+            engine = SpeechEngine(rate=5, log_path=None, volume=40)
+            mine.append(engine)
             engine.speak("一回目")
             deadline = time.time() + 3
             while not any("発声せず" in m for m in logged) and time.time() < deadline:
@@ -191,6 +228,7 @@ class EngineRobustnessTests(unittest.TestCase):
 
         self.assertEqual(2, len(created))
         self.assertEqual(5, created[1].Rate)  # 作り直しても話速を引き継ぐ
+        self.assertEqual(40, created[1].Volume)  # 音量も引き継ぐ
         self.assertIn((2, "二回目"), spoken)
         self.assertTrue(any("作り直した" in m for m in logged))
 

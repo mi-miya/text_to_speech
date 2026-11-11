@@ -41,6 +41,8 @@ AUTO_RESTART_IDLE = 10 * 60     # 再起動するのは、読み上げも取得�
 
 RATE_MIN = -10  # SAPI 話速の下限(最も遅い)
 RATE_MAX = 10   # SAPI 話速の上限(最も速い)。0 が標準。刻みはこの 21 段階が最小
+VOLUME_MIN = 0    # SAPI 音量の下限(無音)
+VOLUME_MAX = 100  # SAPI 音量の上限。既定もこの値
 
 COLOR_IDLE = "#1E6ED2"      # 待機中: 青
 COLOR_SPEAKING = "#2FA84F"  # 読み上げ中: 緑
@@ -154,9 +156,10 @@ class FloatingWidget:
         self._has_moved = False
         self._flashing = False
 
-        self._rate_win = None       # 話速調整ウィンドウ(単一インスタンス)
+        self._adjust_win = None     # 話速・音量の調整ウィンドウ(単一インスタンス)
         self._rate_scale = None
-        self._rate_save_job = None  # ドラッグ確定を遅延保存するための after id
+        self._volume_scale = None
+        self._save_job = None       # ドラッグ確定を遅延保存するための after id
         self._flash_job = None      # 橙フラッシュ解除の after id
 
         self._poll_state()
@@ -168,7 +171,7 @@ class FloatingWidget:
         self.menu.add_command(label="読み上げを停止 (Esc)", command=self.app.stop)
         self.menu.add_separator()
 
-        self.menu.add_command(label="話速を調整...", command=self._open_rate_dialog)
+        self.menu.add_command(label="話速・音量を調整...", command=self._open_adjust_dialog)
 
         self._voice_var = tk.StringVar(value=self.app.active_voice or "")
         voice_menu = tk.Menu(self.menu, tearoff=0)
@@ -191,79 +194,98 @@ class FloatingWidget:
         finally:
             self.menu.grab_release()
 
-    # ---- 話速の調整(スライダー) ----
+    # ---- 話速・音量の調整(スライダー) ----
 
-    def _open_rate_dialog(self):
+    def _open_adjust_dialog(self):
         # 既に開いていれば前面に出すだけ(二重起動を防ぐ)
-        if self._rate_win is not None and self._rate_win.winfo_exists():
-            self._rate_win.deiconify()
-            self._rate_win.lift()
-            self._rate_win.focus_force()
+        if self._adjust_win is not None and self._adjust_win.winfo_exists():
+            self._adjust_win.deiconify()
+            self._adjust_win.lift()
+            self._adjust_win.focus_force()
             return
 
         win = tk.Toplevel(self.root)
-        self._rate_win = win
-        win.title("話速の調整")
+        self._adjust_win = win
+        win.title("話速・音量の調整")
         win.attributes("-topmost", True)
         win.resizable(False, False)
         win.configure(padx=16, pady=12)
-        win.protocol("WM_DELETE_WINDOW", self._close_rate_dialog)
+        win.protocol("WM_DELETE_WINDOW", self._close_adjust_dialog)
 
-        tk.Label(win, text="遅い ←  0=標準  → 速い",
+        tk.Label(win, text="話速:  遅い ←  0=標準  → 速い",
                  font=("Yu Gothic UI", 10)).pack(anchor="w")
+        self._rate_scale = self._make_scale(
+            win, RATE_MIN, RATE_MAX, 5, self.app.config.rate, self._on_rate_slide)
 
-        self._rate_scale = tk.Scale(
-            win, from_=RATE_MIN, to=RATE_MAX, orient="horizontal", length=300,
-            resolution=1, tickinterval=5, showvalue=True,
-            font=("Yu Gothic UI", 9), command=self._on_rate_slide)
-        self._rate_scale.set(self.app.config.rate)
-        self._rate_scale.pack(fill="x", pady=(4, 8))
-        # ドラッグ確定時に保存(キー操作でも動くよう遅延保存も併用)
-        self._rate_scale.bind("<ButtonRelease-1>", lambda e: self._persist_rate())
+        tk.Label(win, text="音量:  小さい ←  100=標準(最大)",
+                 font=("Yu Gothic UI", 10)).pack(anchor="w")
+        self._volume_scale = self._make_scale(
+            win, VOLUME_MIN, VOLUME_MAX, 25, self.app.config.volume, self._on_volume_slide)
 
         btns = tk.Frame(win)
         btns.pack(fill="x")
-        tk.Button(btns, text="試聴", width=8, command=self._preview_rate).pack(side="left")
-        tk.Button(btns, text="標準に戻す", width=10, command=self._reset_rate).pack(
+        tk.Button(btns, text="試聴", width=8, command=self._preview).pack(side="left")
+        tk.Button(btns, text="標準に戻す", width=10, command=self._reset).pack(
             side="left", padx=6)
-        tk.Button(btns, text="閉じる", width=8, command=self._close_rate_dialog).pack(
+        tk.Button(btns, text="閉じる", width=8, command=self._close_adjust_dialog).pack(
             side="right")
 
         # フローティングアイコンの近くに表示する
         win.update_idletasks()
         wx, wy = self.root.winfo_x(), self.root.winfo_y()
-        win.geometry(f"+{max(0, wx - 330)}+{max(0, wy)}")
+        win.geometry(f"+{max(0, wx - 330)}+{max(0, wy - win.winfo_height() + 60)}")
+
+    def _make_scale(self, win, low, high, tick, value, command):
+        scale = tk.Scale(
+            win, from_=low, to=high, orient="horizontal", length=300,
+            resolution=1, tickinterval=tick, showvalue=True,
+            font=("Yu Gothic UI", 9), command=command)
+        scale.set(value)
+        scale.pack(fill="x", pady=(4, 8))
+        # ドラッグ確定時に保存(キー操作でも動くよう遅延保存も併用)
+        scale.bind("<ButtonRelease-1>", lambda e: self._persist())
+        return scale
 
     def _on_rate_slide(self, value):
-        rate = int(float(value))
-        self.app.set_rate(rate, persist=False)  # 即時反映(保存は遅延)
-        if self._rate_save_job is not None:
-            self.root.after_cancel(self._rate_save_job)
-        self._rate_save_job = self.root.after(500, self._persist_rate)
+        self.app.set_rate(int(float(value)), persist=False)  # 即時反映(保存は遅延)
+        self._schedule_persist()
 
-    def _persist_rate(self):
-        if self._rate_save_job is not None:
-            self.root.after_cancel(self._rate_save_job)
-            self._rate_save_job = None
+    def _on_volume_slide(self, value):
+        self.app.set_volume(int(float(value)), persist=False)
+        self._schedule_persist()
+
+    def _schedule_persist(self):
+        if self._save_job is not None:
+            self.root.after_cancel(self._save_job)
+        self._save_job = self.root.after(500, self._persist)
+
+    def _persist(self):
+        if self._save_job is not None:
+            self.root.after_cancel(self._save_job)
+            self._save_job = None
         self.app.config.save()
 
-    def _preview_rate(self):
-        self.app.speech.speak("これは話速の試聴です。1、2、3、4、5。")
+    def _preview(self):
+        self.app.speech.speak("これは試聴です。1、2、3、4、5。")
 
-    def _reset_rate(self):
+    def _reset(self):
         if self._rate_scale is not None:
             self._rate_scale.set(0)
+        if self._volume_scale is not None:
+            self._volume_scale.set(VOLUME_MAX)
         # Scale.set のコールバックは idle 時に遅れて呼ばれるため、それを待たずに
-        # 0 を反映してから保存する(待つと旧値が保存され、終了で失われ得る)
+        # 標準値を反映してから保存する(待つと旧値が保存され、終了で失われ得る)
         self.app.set_rate(0, persist=False)
-        self._persist_rate()
+        self.app.set_volume(VOLUME_MAX, persist=False)
+        self._persist()
 
-    def _close_rate_dialog(self):
-        self._persist_rate()
-        if self._rate_win is not None:
-            self._rate_win.destroy()
-            self._rate_win = None
+    def _close_adjust_dialog(self):
+        self._persist()
+        if self._adjust_win is not None:
+            self._adjust_win.destroy()
+            self._adjust_win = None
             self._rate_scale = None
+            self._volume_scale = None
 
     # ---- ドラッグ移動 / クリック ----
 
@@ -291,7 +313,7 @@ class FloatingWidget:
         # capture スレッドは Event を立てるだけにし、Tk の操作は必ず
         # mainloop のスレッドで行う。Tkinter のスレッド間呼び出しによる
         # RuntimeError やまれな停止を防ぐ。
-        dialog_open = self._rate_win is not None and self._rate_win.winfo_exists()
+        dialog_open = self._adjust_win is not None and self._adjust_win.winfo_exists()
         if self.app.auto_restart_due(busy=dialog_open):
             self.app.restart(auto=True)
             return
@@ -322,7 +344,8 @@ class FloatingWidget:
 class App:
     def __init__(self):
         self.config = Config()
-        self.speech = SpeechEngine(rate=self.config.rate, voice_name=self.config.voice)
+        self.speech = SpeechEngine(rate=self.config.rate, voice_name=self.config.voice,
+                                   volume=self.config.volume)
         self.capture_error_pending = threading.Event()
         self.capturer = TextCapturer(
             on_text=self._on_text,
@@ -407,6 +430,10 @@ class App:
     def set_rate(self, value, persist=True):
         self.config.set_rate(value, persist)
         self.speech.set_rate(value)
+
+    def set_volume(self, value, persist=True):
+        self.config.set_volume(value, persist)
+        self.speech.set_volume(value)
 
     def set_voice(self, name):
         self.config.voice = name

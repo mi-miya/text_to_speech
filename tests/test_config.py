@@ -90,6 +90,21 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(6, config.Config().rate)
             self.assertFalse(os.path.exists(path + ".tmp"))
 
+    def test_volume_defaults_clamps_and_saves(self):
+        self.assertEqual(100, self._load_raw(b'{"rate": 1}').volume)  # 以前の設定ファイル
+        self.assertEqual(100, self._load_raw(b'{"volume": "loud"}').volume)
+        self.assertEqual(100, self._load_raw(b'{"volume": true}').volume)
+        self.assertEqual(0, self._load_raw(b'{"volume": -5}').volume)
+        self.assertEqual(100, self._load_raw(b'{"volume": 250}').volume)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "config.json")
+            with mock.patch.object(config, "CONFIG_PATH", path):
+                settings = config.Config()
+                settings.set_volume(40, persist=False)
+                self.assertFalse(os.path.exists(path))
+                settings.save()
+                self.assertEqual(40, config.Config().volume)
+
     def test_set_rate_without_persist_is_saved_only_by_save(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "config.json")
