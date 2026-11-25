@@ -125,6 +125,8 @@ EMPTY_PAGE_NAME = "Chrome Legacy Window"
 # いた別タブのページを 15 回続けて読んだ)。正しい入れ物はタブの枠 (region) の下に
 # あるが、取り残された入れ物はウィンドウ直下にぶら下がるので見分けられる。
 # 今のタブのページは、ウィンドウからクリック位置を含む枠をたどって探し直す。
+# Claude デスクトップでは、表示中のページの手前に中身の無い入れ物が重なり、
+# 何を押しても空の文書が返ることがある(実測)。これも同じ方法で探し直す。
 ACTIVE_PAGE_DEPTH = 16    # ウィンドウからページの入れ物まで降りる最大の深さ(実測 7〜8)
 ACTIVE_PAGE_BUDGET = 300  # 探し直しで見る子ノード数の上限
 # この高さ以上の画像は、本文の上に重なった大きな入れ物とみなす。Google マップの
@@ -318,29 +320,36 @@ class TextCapturer(threading.Thread):
         host, doc = _page_host_of(control)
         if host is None or doc is None:
             return None
-        window = _detached_window(host)
-        if window is None:
-            return None   # タブの枠の下にある = 表示中のタブ
         doc_name = _name_of(doc)
-        win_name = _name_of(window)
-        if doc_name and doc_name in win_name:
-            return None   # ウィンドウ名と同じページ。読んでよい
+        window = _detached_window(host)
+        if window is not None:
+            win_name = _name_of(window)
+            if doc_name and doc_name in win_name:
+                return None   # ウィンドウ名と同じページ。読んでよい
+            reason = (f"前のタブのページを掴んでいる: 文書={doc_name[:30]!r} "
+                      f"ウィンドウ={win_name[:30]!r}")
+        elif _is_blank_document(doc):
+            window = _window_of(host)
+            if window is None:
+                return None
+            reason = "中身の無いページの入れ物を掴んでいる(手前に重なった空の入れ物)"
+        else:
+            return None   # タブの枠の下にある中身のあるページ = 表示中のページ
         if log is not None:
-            log.append(f"=> 前のタブのページを掴んでいる: 文書={doc_name[:30]!r} "
-                       f"ウィンドウ={win_name[:30]!r}")
+            log.append(f"=> {reason}")
         active = _active_page_document(window, x, y, doc)
         if active is None:
             if log is not None:
-                log.append("=> 今のタブのページが見つからない → 取得失敗")
+                log.append("=> 表示中のページが見つからない → 取得失敗")
             return False
         found = self._search_by_rect(active, x, y, log)
         if found is None:
             if log is not None:
-                log.append("=> 今のタブのページで押した位置が見つからない → 取得失敗")
+                log.append("=> 表示中のページで押した位置が見つからない → 取得失敗")
             return False
         node, _, leaf = self._resolve_click_target(found, x, y, log)
         if log is not None:
-            log.append(f"=> 今のタブのページで選び直した: {_name_of(active)[:30]!r}")
+            log.append(f"=> 表示中のページで選び直した: {_name_of(active)[:30]!r}")
         return node, leaf
 
     def _retarget_stale(self, control, x, y, log=None):
@@ -467,6 +476,9 @@ class TextCapturer(threading.Thread):
                 continue
             if leaf or settled:
                 break
+            if _is_document(control) and _is_blank_document(control):
+                break   # 手前に重なった空の入れ物。取り直しても同じなので、
+                        # すぐ _leave_stale_page で表示中のページを探す
             log.append(f"=> クリック対象が葉に届かず(試行{attempt + 1}) → 取り直す")
             attempt += 1
             if attempt < CLICK_TARGET_RETRY:
@@ -1502,6 +1514,37 @@ def _page_host_of(node):
     return None, None
 
 
+def _is_blank_document(doc):
+    """文書の中身が空(￼ や空白だけ)か。TextPattern が無ければ判断せず False。
+
+    Claude デスクトップは、表示中のページの手前に中身の無いページの入れ物を
+    重ねることがある(実測: 同じ矩形の入れ物が 2 枚あり、手前は '￼' だけ)。
+    座標→要素の問い合わせは手前の空の文書を返すので、何を押しても取得失敗になる。
+    """
+    try:
+        pattern = doc.GetPattern(auto.PatternId.TextPattern)
+        if not pattern:
+            return False
+        text = pattern.DocumentRange.GetText(200) or ""
+    except Exception:
+        return False
+    return not text.replace("￼", "").strip()
+
+
+def _window_of(node):
+    """node を含むウィンドウ (WindowControl)。見つからなければ None。"""
+    for _ in range(MAX_WALK_UP):
+        if node is None:
+            return None
+        try:
+            if node.ControlTypeName == "WindowControl":
+                return node
+            node = node.GetParentControl()
+        except Exception:
+            return None
+    return None
+
+
 def _detached_window(host):
     """入れ物がタブの枠を通らずウィンドウ直下にあれば、そのウィンドウを返す。"""
     try:
@@ -1544,7 +1587,7 @@ def _active_page_document(window, x, y, stale_doc):
                 except Exception:
                     docs = []
                 for d in docs:
-                    if not _same_node(d, stale_doc):
+                    if not _same_node(d, stale_doc) and not _is_blank_document(d):
                         return d
                 continue
             if kind == "DocumentControl":

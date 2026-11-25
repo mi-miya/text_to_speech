@@ -437,6 +437,24 @@ class EmptyPageTests(unittest.TestCase):
         self.assertFalse(capture._is_empty_page(None))
 
 
+class _TextDoc(_FakeNode):
+    """TextPattern で text を返す文書。"""
+
+    def __init__(self, text, **kw):
+        super().__init__("DocumentControl", rect=(0, 100, 1000, 1000), **kw)
+        self._text = text
+
+    def GetPattern(self, _):
+        doc = self
+
+        class _Pattern:
+            class DocumentRange:
+                @staticmethod
+                def GetText(_n):
+                    return doc._text
+        return _Pattern
+
+
 def _link(parent, *children):
     parent._children = list(children)
     for c in children:
@@ -508,6 +526,28 @@ class StaleTabPageTests(unittest.TestCase):
     def test_a_detached_page_with_the_window_title_is_read_as_is(self):
         self.window.Name = "Bond 保育システム - Google Chrome"
         self.assertIsNone(self.capturer._leave_stale_page(self.old_text, 500, 500, []))
+
+    def test_a_blank_page_stacked_in_front_is_skipped(self):
+        # Claude デスクトップ: 表示中のページの手前に、同じ枠の下で空の入れ物が重なる
+        blank = _TextDoc("￼")
+        front = _FakeNode("PaneControl", "Chrome Legacy Window",
+                          "Chrome_RenderWidgetHostHWND", rect=(0, 100, 1000, 1000))
+        _link(front, blank)
+        inner = self.new_host._parent
+        _link(inner, *(inner._children + [front]))
+        target = _FakeNode("TextControl", "今のページの本文", parent=self.new_doc)
+        self.capturer._search_by_rect = lambda root, x, y, log=None: (
+            target if root is self.new_doc else None)
+        node, _ = self.capturer._leave_stale_page(blank, 500, 500, [])
+        self.assertIs(target, node)
+
+    def test_a_page_with_content_under_the_tab_frame_is_left_alone(self):
+        self.assertIsNone(self.capturer._leave_stale_page(self.new_doc, 500, 500, []))
+
+    def test_blank_means_only_placeholders_or_spaces(self):
+        self.assertTrue(capture._is_blank_document(_TextDoc("￼\n ")))
+        self.assertFalse(capture._is_blank_document(_TextDoc("本文")))
+        self.assertFalse(capture._is_blank_document(_FakeNode("DocumentControl")))
 
     def test_pages_outside_chrome_are_left_alone(self):
         self.assertIsNone(self.capturer._leave_stale_page(
