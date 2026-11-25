@@ -437,6 +437,83 @@ class EmptyPageTests(unittest.TestCase):
         self.assertFalse(capture._is_empty_page(None))
 
 
+def _link(parent, *children):
+    parent._children = list(children)
+    for c in children:
+        c._parent = parent
+    return parent
+
+
+class StaleTabPageTests(unittest.TestCase):
+    """Chrome がタブ切り替え後も前のタブのページの入れ物を返す場合。"""
+
+    def setUp(self):
+        host_cls = "Chrome_RenderWidgetHostHWND"
+        self.window = _FakeNode("WindowControl", "【AIニュース】朝刊 - Google Chrome",
+                                rect=(0, 0, 1000, 1000))
+        # 表示中のタブ: ウィンドウ > 枠 > 枠 > 入れ物 > 文書
+        self.new_doc = _FakeNode("DocumentControl", "【AIニュース】朝刊",
+                                 rect=(0, 100, 1000, 1000))
+        self.new_host = _FakeNode("PaneControl", "Chrome Legacy Window", host_cls,
+                                  rect=(0, 100, 1000, 1000))
+        _link(self.new_host, self.new_doc)
+        toolbar = _FakeNode("PaneControl", rect=(0, 0, 1000, 100))
+        placeholder = _FakeNode("DocumentControl", rect=(0, 100, 1000, 1000))
+        inner = _link(_FakeNode("PaneControl", rect=(0, 100, 1000, 1000)),
+                      placeholder, self.new_host)
+        region = _link(_FakeNode("PaneControl", rect=(0, 0, 1000, 1000)), toolbar, inner)
+        _link(self.window, region)
+        # 前のタブの取り残された入れ物: ウィンドウ直下にぶら下がる
+        self.old_doc = _FakeNode("DocumentControl", "Bond 保育システム",
+                                 rect=(0, 100, 1000, 1000))
+        self.old_text = _FakeNode("TextControl", "前のページの本文", parent=self.old_doc)
+        self.old_doc._children = [self.old_text]
+        self.old_host = _FakeNode("PaneControl", "Chrome Legacy Window", host_cls,
+                                  children=[self.old_doc], parent=self.window)
+        self.old_doc._parent = self.old_host
+        self.capturer = TextCapturer(lambda t: None, lambda: None, debug=False)
+
+    def test_a_page_host_hanging_directly_under_the_window_is_detached(self):
+        host, doc = capture._page_host_of(self.old_text)
+        self.assertIs(self.old_host, host)
+        self.assertIs(self.old_doc, doc)
+        self.assertIs(self.window, capture._detached_window(host))
+
+    def test_the_page_host_of_the_shown_tab_is_not_detached(self):
+        host, doc = capture._page_host_of(self.new_doc)
+        self.assertIs(self.new_host, host)
+        self.assertIsNone(capture._detached_window(host))
+
+    def test_the_shown_tab_page_is_found_from_the_window(self):
+        found = capture._active_page_document(self.window, 500, 500, self.old_doc)
+        self.assertIs(self.new_doc, found)
+
+    def test_the_old_page_is_never_returned_as_the_shown_one(self):
+        self.new_host._children = [self.old_doc]
+        self.assertIsNone(
+            capture._active_page_document(self.window, 500, 500, self.old_doc))
+
+    def test_reading_moves_to_the_shown_tab_page(self):
+        target = _FakeNode("TextControl", "今のページの本文", parent=self.new_doc)
+        self.capturer._search_by_rect = lambda root, x, y, log=None: (
+            target if root is self.new_doc else None)
+        node, leaf = self.capturer._leave_stale_page(self.old_text, 500, 500, [])
+        self.assertIs(target, node)
+        self.assertTrue(leaf)
+
+    def test_it_fails_rather_than_reading_the_old_page(self):
+        self.new_host._children = []
+        self.assertIs(False, self.capturer._leave_stale_page(self.old_text, 500, 500, []))
+
+    def test_a_detached_page_with_the_window_title_is_read_as_is(self):
+        self.window.Name = "Bond 保育システム - Google Chrome"
+        self.assertIsNone(self.capturer._leave_stale_page(self.old_text, 500, 500, []))
+
+    def test_pages_outside_chrome_are_left_alone(self):
+        self.assertIsNone(self.capturer._leave_stale_page(
+            _FakeNode("TextControl", "メモ帳"), 500, 500, []))
+
+
 class CoverImageTests(unittest.TestCase):
     def test_a_tall_image_is_a_cover(self):
         self.assertTrue(capture._is_cover_image(

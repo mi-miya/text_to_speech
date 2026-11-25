@@ -119,6 +119,14 @@ EMPTY_PAGE_RETRY = 5
 EMPTY_PAGE_RETRY_DELAY = 0.1
 EMPTY_PAGE_CLASS = "Chrome_RenderWidgetHostHWND"
 EMPTY_PAGE_NAME = "Chrome Legacy Window"
+# Chrome はタブを切り替えたあとも、前のタブのページの入れ物を画面に残すことがある。
+# すると座標→要素の問い合わせが前のタブの要素を返し、いま表示しているページでは
+# なく、前に開いていたページを読み上げてしまう(実測: Gmail を表示中に、前に開いて
+# いた別タブのページを 15 回続けて読んだ)。正しい入れ物はタブの枠 (region) の下に
+# あるが、取り残された入れ物はウィンドウ直下にぶら下がるので見分けられる。
+# 今のタブのページは、ウィンドウからクリック位置を含む枠をたどって探し直す。
+ACTIVE_PAGE_DEPTH = 16    # ウィンドウからページの入れ物まで降りる最大の深さ(実測 7〜8)
+ACTIVE_PAGE_BUDGET = 300  # 探し直しで見る子ノード数の上限
 # この高さ以上の画像は、本文の上に重なった大きな入れ物とみなす。Google マップの
 # 左の欄では、クチコミの上を押しても欄全体を覆う画像が返ることがあり、そのまま
 # 読むとページ先頭の検索欄から読み上げていた。
@@ -301,6 +309,40 @@ class TextCapturer(threading.Thread):
                           else "該当なし"))
         return node
 
+    def _leave_stale_page(self, control, x, y, log=None):
+        """前のタブのページを掴んでいたら、いま表示しているタブのページへ移す。
+
+        戻り値は None(移す必要なし)、(対象ノード, 葉に到達したか)、または
+        False(前のタブだと分かったが今のページが見つからない = 取得失敗)。
+        """
+        host, doc = _page_host_of(control)
+        if host is None or doc is None:
+            return None
+        window = _detached_window(host)
+        if window is None:
+            return None   # タブの枠の下にある = 表示中のタブ
+        doc_name = _name_of(doc)
+        win_name = _name_of(window)
+        if doc_name and doc_name in win_name:
+            return None   # ウィンドウ名と同じページ。読んでよい
+        if log is not None:
+            log.append(f"=> 前のタブのページを掴んでいる: 文書={doc_name[:30]!r} "
+                       f"ウィンドウ={win_name[:30]!r}")
+        active = _active_page_document(window, x, y, doc)
+        if active is None:
+            if log is not None:
+                log.append("=> 今のタブのページが見つからない → 取得失敗")
+            return False
+        found = self._search_by_rect(active, x, y, log)
+        if found is None:
+            if log is not None:
+                log.append("=> 今のタブのページで押した位置が見つからない → 取得失敗")
+            return False
+        node, _, leaf = self._resolve_click_target(found, x, y, log)
+        if log is not None:
+            log.append(f"=> 今のタブのページで選び直した: {_name_of(active)[:30]!r}")
+        return node, leaf
+
     def _retarget_stale(self, control, x, y, log=None):
         """Chromium が古い位置を報告している項目を見抜き、クリック対象を選び直す。
 
@@ -429,6 +471,12 @@ class TextCapturer(threading.Thread):
             attempt += 1
             if attempt < CLICK_TARGET_RETRY:
                 time.sleep(CLICK_TARGET_RETRY_DELAY)
+
+        moved = self._leave_stale_page(control, x, y, log)
+        if moved is False:
+            return None
+        if moved is not None:
+            control, leaf = moved
 
         if _is_cover_image(control):
             # 本文の上に重なった大きな画像。全要素の矩形から、押した位置の本当の
@@ -1405,6 +1453,105 @@ def _is_empty_page(node):
         return not node.GetChildren()
     except Exception:
         return True
+
+
+def _is_page_host(node):
+    """Chrome のページの入れ物 (Chrome Legacy Window) か。"""
+    try:
+        if node.ControlTypeName != "PaneControl":
+            return False
+        return ((node.ClassName or "") == EMPTY_PAGE_CLASS
+                or (node.Name or "") == EMPTY_PAGE_NAME)
+    except Exception:
+        return False
+
+
+def _name_of(node):
+    try:
+        return node.Name or ""
+    except Exception:
+        return ""
+
+
+def _same_node(a, b):
+    """UI Automation の要素は問い合わせるたびに別のオブジェクトになるので、
+    RuntimeId で同じ要素かを比べる。"""
+    if a is b:
+        return True
+    try:
+        ra, rb = a.GetRuntimeId(), b.GetRuntimeId()
+    except Exception:
+        return False
+    return bool(ra) and list(ra) == list(rb)
+
+
+def _page_host_of(node):
+    """node を含むページの入れ物と、その直下の文書を返す。無ければ (None, None)。"""
+    doc = None
+    for _ in range(MAX_WALK_UP):
+        if node is None:
+            break
+        if _is_page_host(node):
+            return node, doc
+        if _is_document(node):
+            doc = node   # iframe の中なら、入れ物に最も近い(=ページ全体の)文書が残る
+        try:
+            node = node.GetParentControl()
+        except Exception:
+            break
+    return None, None
+
+
+def _detached_window(host):
+    """入れ物がタブの枠を通らずウィンドウ直下にあれば、そのウィンドウを返す。"""
+    try:
+        parent = host.GetParentControl()
+        if parent is not None and parent.ControlTypeName == "WindowControl":
+            return parent
+    except Exception:
+        pass
+    return None
+
+
+def _active_page_document(window, x, y, stale_doc):
+    """ウィンドウから、クリック位置を含む枠をたどって表示中のページの文書を探す。
+
+    ページの中身には降りない(数千要素あって遅い)。前のタブの文書 stale_doc と
+    同じものしか無ければ None。
+    """
+    budget = ACTIVE_PAGE_BUDGET
+    stack = [(window, 0)]
+    while stack and budget > 0:
+        node, depth = stack.pop()
+        try:
+            children = node.GetChildren()
+        except Exception:
+            continue
+        for child in children:
+            budget -= 1
+            if budget <= 0:
+                break
+            try:
+                kind = child.ControlTypeName
+                r = child.BoundingRectangle
+            except Exception:
+                continue
+            if not (r.left <= x < r.right and r.top <= y < r.bottom):
+                continue
+            if _is_page_host(child):
+                try:
+                    docs = [k for k in child.GetChildren() if _is_document(k)]
+                except Exception:
+                    docs = []
+                for d in docs:
+                    if not _same_node(d, stale_doc):
+                        return d
+                continue
+            if kind == "DocumentControl":
+                continue   # ページの中身(またはタブの仮置き)。入れ物はこの外にある
+            if depth < ACTIVE_PAGE_DEPTH:
+                stack.append((child, depth + 1))
+    return None
 
 
 def _is_cover_image(node):
